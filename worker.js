@@ -66,6 +66,13 @@ const HTML_HEADERS = {
 const SUB_CACHE = new Map();
 const LAST_GOOD_MEM = new Map();
 const RATE_LIMIT = new Map();
+const TELEGRAM_CACHE = {
+  invalidTokenUntil: 0,
+  invalidTokenLoggedAt: 0,
+  getMe: { at: 0, result: null },
+};
+const TELEGRAM_TOKEN_REGEX = /^\d+:[A-Za-z0-9_-]+$/;
+const TELEGRAM_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const ERROR_CODES = {
   E_AUTH_UNAUTHORIZED: {
@@ -633,12 +640,17 @@ const fetchWithLogs = async (url, options = {}, meta = {}, logger) => {
   });
   try {
     const res = await fetch(url, options);
-    log.info("fetch_end", {
+    const endPayload = {
       url: redactedUrl,
       status: res.status,
       duration_ms: Date.now() - start,
       ...meta,
-    });
+    };
+    if (res.status >= 400) {
+      log.warn("fetch_end", endPayload);
+    } else {
+      log.info("fetch_end", endPayload);
+    }
     return res;
   } catch (err) {
     log.error("fetch_failed", err, {
@@ -650,6 +662,125 @@ const fetchWithLogs = async (url, options = {}, meta = {}, logger) => {
       ...meta,
     });
     throw err;
+  }
+};
+
+const getTelegramToken = (env, logger) => {
+  const raw = String(env?.TELEGRAM_TOKEN || "").trim();
+  const now = Date.now();
+  if (!raw || !TELEGRAM_TOKEN_REGEX.test(raw)) {
+    if (now > TELEGRAM_CACHE.invalidTokenUntil) {
+      TELEGRAM_CACHE.invalidTokenUntil = now + TELEGRAM_CACHE_TTL_MS;
+      if (now - TELEGRAM_CACHE.invalidTokenLoggedAt > TELEGRAM_CACHE_TTL_MS) {
+        TELEGRAM_CACHE.invalidTokenLoggedAt = now;
+        (logger || Logger).error("telegram_token_invalid", new Error("Invalid TELEGRAM_TOKEN format"), {
+          error_code: "E_TELEGRAM_API",
+          reason: "Invalid TELEGRAM_TOKEN format",
+          hints: [
+            "Check TELEGRAM_TOKEN",
+            "Call getMe",
+            "Verify bot token has no 'bot' prefix",
+            "Trim whitespace",
+          ],
+          severity: "CRITICAL",
+        });
+      }
+    }
+    return null;
+  }
+  return raw;
+};
+
+const telegramHintsForStatus = (status) => {
+  const hints = [
+    "Check TELEGRAM_TOKEN",
+    "Call getMe",
+    "Verify bot token has no 'bot' prefix",
+    "Trim whitespace",
+  ];
+  if (status === 404) {
+    hints.push("Likely invalid TELEGRAM_TOKEN or wrong endpoint/method");
+  }
+  return hints;
+};
+
+const telegramFetch = async (methodName, payload, ctx = {}) => {
+  const start = Date.now();
+  const log = ctx.logger || Logger;
+  const token = getTelegramToken(ctx.env, log);
+  const route = `/bot***/${methodName}`;
+  const label = ctx.label || `telegram_${methodName}`;
+  if (!token) {
+    return {
+      ok: false,
+      status: 0,
+      skipped: true,
+      reason: "invalid_telegram_token",
+    };
+  }
+  const url = `https://api.telegram.org/bot${token}/${methodName}`;
+  const options = payload
+    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }
+    : { method: "GET" };
+  try {
+    const res = await fetch(url, options);
+    const durationMs = Date.now() - start;
+    const contentType = res.headers.get("content-type") || "";
+    let bodyText = "";
+    try {
+      bodyText = await res.text();
+    } catch {
+      bodyText = "";
+    }
+    let telegram = null;
+    if (contentType.includes("application/json") || bodyText.trim().startsWith("{")) {
+      try {
+        const parsed = JSON.parse(bodyText);
+        telegram = {
+          ok: parsed.ok,
+          error_code: parsed.error_code,
+          description: parsed.description,
+        };
+      } catch {
+        telegram = null;
+      }
+    }
+    const logPayload = {
+      label,
+      duration_ms: durationMs,
+      status: res.status,
+      route,
+      request_id: ctx.request_id,
+      operator_id: ctx.operator_id,
+      telegram_user_id: ctx.telegram_user_id,
+      telegram,
+    };
+    if (res.ok) {
+      log.info("telegram_api_response", logPayload);
+    } else {
+      log.error("telegram_api_response", new Error("Telegram API responded with non-2xx"), {
+        ...logPayload,
+        error_code: "E_TELEGRAM_API",
+        reason: "Telegram API responded with non-2xx",
+        hints: telegramHintsForStatus(res.status),
+        http_status: res.status,
+      });
+    }
+    return { ok: res.ok, status: res.status, telegram };
+  } catch (err) {
+    log.error("telegram_api_fetch_failed", err, {
+      label,
+      duration_ms: Date.now() - start,
+      status: 0,
+      route,
+      request_id: ctx.request_id,
+      operator_id: ctx.operator_id,
+      telegram_user_id: ctx.telegram_user_id,
+      error_code: "E_TELEGRAM_API",
+      reason: "Telegram API fetch failed",
+      hints: telegramHintsForStatus(0),
+    });
+    return { ok: false, status: 0, telegram: null };
   }
 };
 
@@ -1722,36 +1853,24 @@ const NotificationService = {
     if (!channelId || !env.TELEGRAM_TOKEN) return false;
     const maxAttempts = 4;
     for (let i = attempt; i < maxAttempts; i += 1) {
-      try {
-        const res = await fetchWithLogs(
-          `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              chat_id: channelId,
-              text: payload.messageHtml,
-              parse_mode: "HTML",
-              disable_web_page_preview: true,
-            }),
-          },
-          { label: "telegram_send_message", error_code: "E_TELEGRAM_API" },
-          logger
-        );
-        if (res.ok) return true;
-        (logger || Logger).warn("telegram_notify_non_ok", {
-          status: res.status,
-          error_code: "E_TELEGRAM_API",
-          reason: ERROR_CODES.E_TELEGRAM_API.reason,
-          hints: ERROR_CODES.E_TELEGRAM_API.hints,
-        });
-      } catch (err) {
-        (logger || Logger).error("telegram_notify_failed", err, {
-          error_code: "E_TELEGRAM_API",
-          reason: ERROR_CODES.E_TELEGRAM_API.reason,
-          hints: ERROR_CODES.E_TELEGRAM_API.hints,
-        });
-      }
+      const result = await telegramFetch(
+        "sendMessage",
+        {
+          chat_id: channelId,
+          text: payload.messageHtml,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        },
+        { env, logger, label: "telegram_notify_message" }
+      );
+      if (result.ok) return true;
+      (logger || Logger).error("telegram_notify_failed", new Error("Telegram API responded with non-2xx"), {
+        error_code: "E_TELEGRAM_API",
+        reason: "Telegram API responded with non-2xx",
+        hints: telegramHintsForStatus(result.status),
+        status: result.status,
+        telegram: result.telegram,
+      });
       const delayMs = Math.min(30_000, 1000 * 2 ** i);
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
@@ -2126,26 +2245,43 @@ const Telegram = {
     }
 
     const db = env.DB;
+    const text = update.message ? parseMessageText(update.message) : "";
     const operator = await OperatorService.ensureOperator(db, user, env, logger);
     if (!operator) {
-      await this.sendMessage(env, user.id, "⚠️ این ربات فقط برای اپراتورها فعال است.", null, logger);
+      if (update.message && text.startsWith("/invite")) {
+        const response = await this.handleInvite(env, db, user, text, logger);
+        span.end({ status: response?.status || 200, action: "invite" });
+        return response;
+      }
+      if (update.message && text.startsWith("/start")) {
+        const payload = this.buildOnboardingMessage(env);
+        await this.sendMessage(env, user.id, payload.text, payload.keyboard, logger, {
+          telegram_user_id: user.id,
+        });
+        span.end({ status: 200, action: "onboarding" });
+        return new Response("ok");
+      }
+      await this.sendMessage(env, user.id, "⚠️ این ربات فقط برای اپراتورها فعال است.", null, logger, {
+        telegram_user_id: user.id,
+      });
       span.end({ status: 200 });
       return new Response("ok");
     }
 
+    const operatorLogger = (logger || Logger).child({ operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
     if (operator.status === "pending") {
-      await this.sendMessage(env, user.id, "⏳ حساب شما در انتظار تایید مدیر است.", null, logger);
+      await this.sendMessage(env, user.id, "⏳ حساب شما در انتظار تایید مدیر است.", null, operatorLogger);
       span.end({ status: 200 });
       return new Response("ok");
     }
 
     if (update.message) {
-      const response = await this.handleMessage(env, db, operator, update.message, logger);
+      const response = await this.handleMessage(env, db, operator, update.message, operatorLogger);
       span.end({ status: response?.status || 200 });
       return response;
     }
     if (update.callback_query) {
-      const response = await this.handleCallback(env, db, operator, update.callback_query, logger);
+      const response = await this.handleCallback(env, db, operator, update.callback_query, operatorLogger);
       span.end({ status: response?.status || 200 });
       return response;
     }
@@ -2153,9 +2289,17 @@ const Telegram = {
     return new Response("ok");
   },
   async handleMessage(env, db, operator, message, logger) {
-    const span = (logger || Logger).span("telegram_message", { operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
+    const scopedLogger = (logger || Logger).child({ operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
+    const span = scopedLogger.span("telegram_message", { operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
+    logger = scopedLogger;
     const text = parseMessageText(message);
     const settings = await D1.getSettings(db, operator.id, logger);
+
+    if (text.startsWith("/invite")) {
+      const response = await this.handleInvite(env, db, message.from, text, logger, operator);
+      span.end({ action: "invite" });
+      return response;
+    }
 
     if (text === "/cancel") {
       await D1.setPendingAction(db, operator.id, null, null, logger);
@@ -2454,6 +2598,25 @@ const Telegram = {
       span.end({ action: "admin_broadcast" });
       return new Response("ok");
     }
+    if (text.startsWith("/admin_health_telegram")) {
+      if (!isAdmin(operator.telegram_user_id, env)) {
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.", null, logger);
+        span.end({ action: "admin_health_telegram_forbidden" });
+        return new Response("ok");
+      }
+      const result = await this.getMeCached(env, logger, {
+        operator_id: operator.id,
+        telegram_user_id: operator.telegram_user_id,
+      });
+      if (result?.ok && result?.telegram?.ok) {
+        await this.sendMessage(env, message.chat.id, "✅ Telegram getMe: ok", null, logger);
+      } else {
+        const desc = result?.telegram?.description ? ` - ${safeHtml(result.telegram.description)}` : "";
+        await this.sendMessage(env, message.chat.id, `❗️Telegram getMe: error${desc}`, null, logger);
+      }
+      span.end({ action: "admin_health_telegram" });
+      return new Response("ok");
+    }
     if (text.startsWith("/admin_health")) {
       await this.sendMessage(env, message.chat.id, `🟢 سلامت سیستم: ${APP.name} v${APP.version}`, null, logger);
       span.end({ action: "admin_health" });
@@ -2465,7 +2628,9 @@ const Telegram = {
     return new Response("ok");
   },
   async handleCallback(env, db, operator, callback, logger) {
-    const span = (logger || Logger).span("telegram_callback", { operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
+    const scopedLogger = (logger || Logger).child({ operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
+    const span = scopedLogger.span("telegram_callback", { operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
+    logger = scopedLogger;
     const data = decodeCallbackData(callback.data || "", logger);
     const action = data.action || "";
     const chatId = callback.message?.chat?.id;
@@ -2702,7 +2867,62 @@ ${items || "فعلاً لاگی ثبت نشده."}
     `.trim();
     return { text, keyboard: null };
   },
-  async sendMessage(env, chatId, text, keyboard, logger) {
+  buildOnboardingMessage(env) {
+    const baseUrl = String(env.BASE_URL || "").replace(/\/$/, "");
+    const text = "You are not an operator yet. Send /invite CODE or contact admin.";
+    const keyboard = baseUrl
+      ? {
+          inline_keyboard: [[{ text: GLASS_BTN("Open web login"), url: baseUrl }]],
+        }
+      : null;
+    return { text, keyboard };
+  },
+  async handleInvite(env, db, telegramUser, text, logger, existingOperator = null) {
+    const inviteCode = text.replace("/invite", "").trim();
+    const log = logger || Logger;
+    if (!inviteCode) {
+      await this.sendMessage(env, telegramUser.id, "❗️فرمت: /invite CODE", null, log, {
+        telegram_user_id: telegramUser.id,
+      });
+      return new Response("ok");
+    }
+    const invite = await D1.getInviteCode(db, inviteCode, log);
+    if (!invite || invite.used_at) {
+      await this.sendMessage(env, telegramUser.id, "❗️کد دعوت معتبر نیست یا قبلاً استفاده شده است.", null, log, {
+        telegram_user_id: telegramUser.id,
+      });
+      return new Response("ok");
+    }
+    const displayName = telegramUser.first_name || telegramUser.username || "Operator";
+    let operator = existingOperator || (await D1.getOperatorByTelegramId(db, telegramUser.id, log));
+    if (!operator) {
+      operator = await D1.createOperator(db, telegramUser.id, displayName, "operator", "active", log);
+    } else if (operator.status !== "active") {
+      await D1.updateOperatorStatus(db, operator.id, "active", log);
+      operator.status = "active";
+    }
+    await D1.useInviteCode(db, inviteCode, operator.id, log);
+    await D1.logAudit(db, { operator_id: operator.id, event_type: "invite_redeem" }, log);
+    const payload = await this.buildPanel(db, operator, env, log);
+    await this.sendMessage(env, telegramUser.id, payload.text, payload.keyboard, log, {
+      operator_id: operator.id,
+      telegram_user_id: operator.telegram_user_id,
+    });
+    return new Response("ok");
+  },
+  async getMe(env, logger, ctx = {}) {
+    return telegramFetch("getMe", null, { env, logger, label: "telegram_get_me", ...ctx });
+  },
+  async getMeCached(env, logger, ctx = {}) {
+    const now = Date.now();
+    if (TELEGRAM_CACHE.getMe.result && now - TELEGRAM_CACHE.getMe.at < TELEGRAM_CACHE_TTL_MS) {
+      return TELEGRAM_CACHE.getMe.result;
+    }
+    const result = await this.getMe(env, logger, ctx);
+    TELEGRAM_CACHE.getMe = { at: now, result };
+    return result;
+  },
+  async sendMessage(env, chatId, text, keyboard, logger, extraCtx = {}) {
     const body = {
       chat_id: chatId,
       text,
@@ -2710,16 +2930,40 @@ ${items || "فعلاً لاگی ثبت نشده."}
       disable_web_page_preview: true,
     };
     if (keyboard) body.reply_markup = keyboard;
-    await fetchWithLogs(
-      `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-      { label: "telegram_send_message", error_code: "E_TELEGRAM_API" },
-      logger
-    );
+    const log = logger || Logger;
+    try {
+      const result = await telegramFetch("sendMessage", body, {
+        env,
+        logger: log,
+        label: "telegram_send_message",
+        ...extraCtx,
+      });
+      if (!result.ok) {
+        const reason = result.skipped ? "Invalid TELEGRAM_TOKEN format" : "Telegram API responded with non-2xx";
+        const hints = result.skipped ? telegramHintsForStatus(0) : telegramHintsForStatus(result.status);
+        log.error("telegram_send_failed", new Error(reason), {
+          error_code: "E_TELEGRAM_API",
+          reason,
+          hints,
+          status: result.status,
+          telegram: result.telegram,
+          request_id: extraCtx.request_id,
+          operator_id: extraCtx.operator_id,
+          telegram_user_id: extraCtx.telegram_user_id,
+        });
+      }
+      return result.ok;
+    } catch (err) {
+      log.error("telegram_send_failed", err, {
+        error_code: "E_TELEGRAM_API",
+        reason: "Telegram API fetch failed",
+        hints: telegramHintsForStatus(0),
+        request_id: extraCtx.request_id,
+        operator_id: extraCtx.operator_id,
+        telegram_user_id: extraCtx.telegram_user_id,
+      });
+      return false;
+    }
   },
 };
 
@@ -3322,6 +3566,8 @@ const Router = {
     const span = (logger || Logger).span("health");
     let dbOk = true;
     let operators = [];
+    const telegramResult = await Telegram.getMeCached(env, logger);
+    const telegramOk = telegramResult?.ok && telegramResult?.telegram?.ok;
     try {
       await dbFirst(env.DB, "health.ping", () => env.DB.prepare("SELECT 1").first(), logger);
       const rows = await dbAll(
@@ -3341,10 +3587,11 @@ const Router = {
       status: "ok",
       version: APP.version,
       db: dbOk ? "ok" : "error",
+      telegram: telegramOk ? "ok" : "error",
       cache: { memory: SUB_CACHE.size, last_good: LAST_GOOD_MEM.size },
       last_upstream: operators,
     };
-    span.end({ status: 200, db_ok: dbOk });
+    span.end({ status: 200, db_ok: dbOk, telegram_ok: telegramOk });
     return jsonResponse(payload);
   },
   async handleHealthFull(env, logger) {
@@ -3352,6 +3599,8 @@ const Router = {
     let dbOk = true;
     let operators = [];
     let errors = [];
+    const telegramResult = await Telegram.getMeCached(env, logger);
+    const telegramOk = telegramResult?.ok && telegramResult?.telegram?.ok;
     try {
       await dbFirst(env.DB, "health_full.ping", () => env.DB.prepare("SELECT 1").first(), logger);
       const rows = await dbAll(
@@ -3378,11 +3627,12 @@ const Router = {
       status: "ok",
       version: APP.version,
       db: dbOk ? "ok" : "error",
+      telegram: telegramOk ? "ok" : "error",
       cache: { memory: SUB_CACHE.size, last_good: LAST_GOOD_MEM.size },
       last_upstream: operators,
       last_errors: errors,
     };
-    span.end({ status: 200, db_ok: dbOk });
+    span.end({ status: 200, db_ok: dbOk, telegram_ok: telegramOk });
     return jsonResponse(payload);
   },
   handleLanding(request, env, logger) {
