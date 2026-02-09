@@ -2340,7 +2340,13 @@ const Router = {
         return;
       }
       const status = statusRes.ok ? statusRes.data : {};
-      statusText.textContent = `وضعیت آپ‌استریم: ${status.last_upstream_status || '-'} | دامنه: ${status.domain_status || '-'} | آخرین اسنپ‌شات: ${status.snapshot_updated_at || '-'}`;
+      statusText.textContent =
+        'وضعیت آپ‌استریم: ' +
+        (status.last_upstream_status || '-') +
+        ' | دامنه: ' +
+        (status.domain_status || '-') +
+        ' | آخرین اسنپ‌شات: ' +
+        (status.snapshot_updated_at || '-');
       linksEl.innerHTML = '';
       (linksRes.data || []).forEach((link) => {
         const row = document.createElement('div');
