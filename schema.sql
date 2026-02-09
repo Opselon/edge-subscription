@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS operator_settings (
   branding TEXT,
   active_domain_id TEXT,
   channel_id TEXT,
-  notify_fetches INTEGER NOT NULL DEFAULT 1 CHECK (notify_fetches IN (0,1)),
+  notify_fetches INTEGER NOT NULL DEFAULT 0 CHECK (notify_fetches IN (0,1)),
   last_fetch_notify_at TEXT,
   last_upstream_status TEXT CHECK (last_upstream_status IN ('ok','invalid')),
   last_upstream_at TEXT,
@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS operator_upstreams (
   priority INTEGER NOT NULL DEFAULT 0,
   headers_json TEXT,
   format_hint TEXT,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  cooldown_until TEXT,
+  last_failure_at TEXT,
+  last_success_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (operator_id) REFERENCES operators(id) ON DELETE CASCADE
@@ -125,12 +129,39 @@ CREATE TABLE IF NOT EXISTS invite_codes (
 CREATE TABLE IF NOT EXISTS last_known_good (
   operator_id TEXT NOT NULL,
   public_token TEXT NOT NULL,
-  body_b64 TEXT NOT NULL,
-  body_format TEXT NOT NULL DEFAULT 'base64_text',
+  body_value TEXT NOT NULL,
+  body_format TEXT NOT NULL CHECK (body_format IN ('base64','plain')),
   headers_json TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (operator_id, public_token),
   FOREIGN KEY (operator_id) REFERENCES operators(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+  token TEXT PRIMARY KEY,
+  operator_id TEXT NOT NULL,
+  body_value TEXT NOT NULL,
+  body_format TEXT NOT NULL CHECK (body_format IN ('base64','plain')),
+  headers_json TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  ttl_sec INTEGER NOT NULL DEFAULT 300,
+  quotas_json TEXT,
+  notify_fetches INTEGER NOT NULL DEFAULT 0 CHECK (notify_fetches IN (0,1)),
+  last_fetch_notify_at TEXT,
+  channel_id TEXT,
+  FOREIGN KEY (operator_id) REFERENCES operators(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS notify_jobs (
+  id TEXT PRIMARY KEY,
+  operator_id TEXT,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','done')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  available_at INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (operator_id) REFERENCES operators(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -161,7 +192,10 @@ CREATE INDEX IF NOT EXISTS idx_domains_operator ON domains(operator_id, active);
 CREATE INDEX IF NOT EXISTS idx_extra_configs_operator ON extra_configs(operator_id, enabled, sort_order);
 CREATE INDEX IF NOT EXISTS idx_customer_links_token ON customer_links(public_token);
 CREATE INDEX IF NOT EXISTS idx_last_known_good_operator ON last_known_good(operator_id, public_token);
+CREATE INDEX IF NOT EXISTS idx_snapshots_token_updated ON snapshots(token, updated_at);
+CREATE INDEX IF NOT EXISTS idx_snapshots_operator ON snapshots(operator_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_operator_time ON audit_logs(operator_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rate_limits_key ON rate_limits(key);
 CREATE INDEX IF NOT EXISTS idx_rate_limits_window ON rate_limits(window_start);
 CREATE INDEX IF NOT EXISTS idx_api_keys_operator ON api_keys(operator_id, key_hash);
 
