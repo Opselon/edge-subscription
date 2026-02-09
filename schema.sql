@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS operator_upstreams (
   weight INTEGER NOT NULL DEFAULT 1,
   priority INTEGER NOT NULL DEFAULT 0,
   headers_json TEXT,
-  format_hint TEXT,
+  format_hint TEXT CHECK (format_hint IN ('template','base','full')),
   failure_count INTEGER NOT NULL DEFAULT 0,
   cooldown_until TEXT,
   last_failure_at TEXT,
