@@ -1,0 +1,12 @@
+{
+  "name": "edge-subscription",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "doctor": "node scripts/doctor.js"
+  },
+  "devDependencies": {
+    "miniflare": "^3.20240405.0"
+  }
+}

@@ -1,13 +1,13 @@
 /**
  * Cloudflare Worker: Operator Subscription Manager
  * Required env vars:
- * TELEGRAM_TOKEN, TELEGRAM_SECRET(optional), LOG_CHANNEL_ID(optional), ADMIN_IDS,
- * UPSTREAM_BASE(optional), UPSTREAM_HOST(optional), BASE_URL(optional)
+ * TELEGRAM_TOKEN, TELEGRAM_SECRET(optional), ADMIN_IDS, SESSION_SECRET
+ * Optional: TELEGRAM_BOT_USERNAME, LOG_CHANNEL_ID, BASE_URL
  */
 
 const APP = {
   name: "Operator Subscription Manager",
-  version: "2.1.0",
+  version: "3.0.0",
   cacheTtlMs: 60_000,
   cacheMaxEntries: 1000,
   rateLimitWindowMs: 10_000,
@@ -19,6 +19,8 @@ const APP = {
   maxOutputLines: 5000,
   notifyFetchIntervalMs: 5 * 60 * 1000,
   upstreamTimeoutMs: 8000,
+  maxRedirects: 2,
+  sessionTtlSec: 60 * 60 * 24,
 };
 
 // =============================
@@ -170,6 +172,7 @@ const parseRulesArgs = (text) => {
       patch.naming_mode = value ? "prefix" : "keep";
     }
     if (key === "keywords") patch.blocked_keywords = value;
+    if (key === "format") patch.output_format = value;
   }
   return patch;
 };
@@ -196,6 +199,17 @@ const redactUrlForLog = (url) => {
   }
 };
 
+const stableDedupe = (items) => {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    if (seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+};
+
 const sanitizeLines = (lines, blockedKeywords = []) => {
   const blockedSet = blockedKeywords.map((item) => item.toLowerCase());
   return lines.filter((line) => {
@@ -209,14 +223,14 @@ const sanitizeLines = (lines, blockedKeywords = []) => {
   });
 };
 
-const limitOutput = (lines) => {
+const limitOutput = (lines, maxLines = APP.maxOutputLines, maxBytes = APP.maxOutputBytes) => {
   const encoder = new TextEncoder();
   const limited = [];
   let bytes = 0;
   for (const line of lines) {
-    if (limited.length >= APP.maxOutputLines) break;
+    if (limited.length >= maxLines) break;
     const lineBytes = encoder.encode(line + "\n").length;
-    if (bytes + lineBytes > APP.maxOutputBytes) break;
+    if (bytes + lineBytes > maxBytes) break;
     bytes += lineBytes;
     limited.push(line);
   }
@@ -224,6 +238,18 @@ const limitOutput = (lines) => {
 };
 
 const hasCRLF = (value) => /\r|\n/.test(value);
+
+const isPrivateIp = (host) => {
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host)) {
+    if (host === "127.0.0.1" || host === "0.0.0.0") return true;
+    if (host.startsWith("10.")) return true;
+    if (host.startsWith("192.168.")) return true;
+    if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return true;
+    if (host.startsWith("169.254.")) return true;
+  }
+  if (host === "localhost" || host === "::1") return true;
+  return false;
+};
 
 const isBlockedHost = (hostname) => {
   const lower = hostname.toLowerCase();
@@ -249,6 +275,117 @@ const parseAddExtra = (text) => {
 const jsonResponse = (payload, status = 200, headers = {}) =>
   new Response(JSON.stringify(payload), { status, headers: { ...JSON_HEADERS, ...headers } });
 
+const parseJsonBody = async (request) => {
+  if (!request.headers.get("content-type")?.includes("application/json")) return null;
+  try {
+    return await request.json();
+  } catch {
+    return null;
+  }
+};
+
+const safeParseJson = (value, fallback = {}) => {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+};
+
+const base64UrlEncode = (data) =>
+  btoa(String.fromCharCode(...new Uint8Array(data)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+
+const base64UrlDecode = (data) => {
+  const padded = data.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = padded.length % 4 === 0 ? padded : padded + "=".repeat(4 - (padded.length % 4));
+  return Uint8Array.from(atob(pad), (c) => c.charCodeAt(0));
+};
+
+const signSession = async (payload, secret) => {
+  const header = { alg: "HS256", typ: "JWT" };
+  const encodedHeader = base64UrlEncode(new TextEncoder().encode(JSON.stringify(header)));
+  const encodedPayload = base64UrlEncode(new TextEncoder().encode(JSON.stringify(payload)));
+  const data = `${encodedHeader}.${encodedPayload}`;
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
+  return `${data}.${base64UrlEncode(signature)}`;
+};
+
+const verifySession = async (token, secret) => {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [encodedHeader, encodedPayload, signature] = parts;
+  const data = `${encodedHeader}.${encodedPayload}`;
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  const ok = await crypto.subtle.verify("HMAC", key, base64UrlDecode(signature), new TextEncoder().encode(data));
+  if (!ok) return null;
+  try {
+    return JSON.parse(new TextDecoder().decode(base64UrlDecode(encodedPayload)));
+  } catch {
+    return null;
+  }
+};
+
+const hashApiKey = async (value) => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+};
+
+const validateTelegramLogin = async (data, botToken) => {
+  if (!data || !data.hash) return false;
+  const secret = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(botToken));
+  const key = await crypto.subtle.importKey("raw", secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const checkString = Object.keys(data)
+    .filter((key) => key !== "hash")
+    .sort()
+    .map((key) => `${key}=${data[key]}`)
+    .join("\n");
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(checkString));
+  const hash = Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return hash === data.hash;
+};
+
+const assertSafeUpstream = (url, allowlist = [], denylist = []) => {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { ok: false, error: "invalid_url" };
+  }
+  if (parsed.protocol !== "https:") return { ok: false, error: "https_only" };
+  if (isPrivateIp(parsed.hostname) || isBlockedHost(parsed.hostname)) return { ok: false, error: "blocked_host" };
+  const host = parsed.hostname.toLowerCase();
+  if (denylist.length && denylist.some((item) => host.includes(item.toLowerCase()))) return { ok: false, error: "denylisted" };
+  if (allowlist.length && !allowlist.some((item) => host.includes(item.toLowerCase()))) return { ok: false, error: "not_allowlisted" };
+  return { ok: true };
+};
+
+const fetchWithRedirects = async (url, options, maxRedirects, validateUrl) => {
+  let currentUrl = url;
+  for (let i = 0; i <= maxRedirects; i += 1) {
+    const res = await fetch(currentUrl, { ...options, redirect: "manual" });
+    if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
+      const nextUrl = new URL(res.headers.get("location"), currentUrl).toString();
+      if (validateUrl) {
+        const check = validateUrl(nextUrl);
+        if (!check.ok) return new Response("blocked", { status: 403 });
+      }
+      currentUrl = nextUrl;
+      continue;
+    }
+    return res;
+  }
+  return new Response("redirect limit", { status: 429 });
+};
+
 // =============================
 // Data Access Layer (D1 queries)
 // =============================
@@ -256,16 +393,19 @@ const D1 = {
   async getOperatorByTelegramId(db, telegramUserId) {
     return db.prepare("SELECT * FROM operators WHERE telegram_user_id = ?").bind(telegramUserId).first();
   },
+  async getOperatorById(db, operatorId) {
+    return db.prepare("SELECT * FROM operators WHERE id = ?").bind(operatorId).first();
+  },
   async listOperators(db) {
     return db.prepare("SELECT * FROM operators ORDER BY created_at DESC").all();
   },
-  async createOperator(db, telegramUserId, displayName, role = "operator") {
+  async createOperator(db, telegramUserId, displayName, role = "operator", status = "pending") {
     const id = crypto.randomUUID();
     await db
       .prepare(
-        "INSERT INTO operators (id, telegram_user_id, display_name, role, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?)"
+        "INSERT INTO operators (id, telegram_user_id, display_name, role, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
       )
-      .bind(id, telegramUserId, displayName || null, role, nowIso(), nowIso())
+      .bind(id, telegramUserId, displayName || null, role, status, nowIso(), nowIso())
       .run();
     await db
       .prepare("INSERT INTO operator_settings (operator_id, created_at, updated_at) VALUES (?, ?, ?)")
@@ -276,10 +416,13 @@ const D1 = {
       .bind(id, nowIso(), nowIso())
       .run();
     await db
-      .prepare("INSERT INTO share_links (id, operator_id, public_token, is_active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)")
+      .prepare("INSERT INTO customer_links (id, operator_id, public_token, enabled, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)")
       .bind(crypto.randomUUID(), id, crypto.randomUUID(), nowIso(), nowIso())
       .run();
     return this.getOperatorByTelegramId(db, telegramUserId);
+  },
+  async updateOperatorStatus(db, operatorId, status) {
+    await db.prepare("UPDATE operators SET status = ?, updated_at = ? WHERE id = ?").bind(status, nowIso(), operatorId).run();
   },
   async removeOperator(db, telegramUserId) {
     await db
@@ -310,15 +453,12 @@ const D1 = {
       .run();
   },
   async listDomains(db, operatorId) {
-    return db
-      .prepare("SELECT * FROM operator_domains WHERE operator_id = ? AND deleted_at IS NULL ORDER BY created_at DESC")
-      .bind(operatorId)
-      .all();
+    return db.prepare("SELECT * FROM domains WHERE operator_id = ? AND deleted_at IS NULL ORDER BY created_at DESC").bind(operatorId).all();
   },
   async createDomain(db, operatorId, domain) {
     await db
       .prepare(
-        "INSERT INTO operator_domains (id, operator_id, domain, verified, verification_token, is_active, created_at, updated_at) VALUES (?, ?, ?, 0, ?, 1, ?, ?)"
+        "INSERT INTO domains (id, operator_id, domain, verified, token, active, created_at, updated_at) VALUES (?, ?, ?, 0, ?, 1, ?, ?)"
       )
       .bind(crypto.randomUUID(), operatorId, domain, crypto.randomUUID(), nowIso(), nowIso())
       .run();
@@ -328,25 +468,25 @@ const D1 = {
       .prepare("UPDATE operator_settings SET active_domain_id = ?, updated_at = ? WHERE operator_id = ?")
       .bind(domainId, nowIso(), operatorId)
       .run();
-    await db.prepare("UPDATE operator_domains SET is_active = 0 WHERE operator_id = ?").bind(operatorId).run();
-    await db
-      .prepare("UPDATE operator_domains SET is_active = 1 WHERE id = ? AND operator_id = ?")
-      .bind(domainId, operatorId)
-      .run();
+    await db.prepare("UPDATE domains SET active = 0 WHERE operator_id = ?").bind(operatorId).run();
+    await db.prepare("UPDATE domains SET active = 1 WHERE id = ? AND operator_id = ?").bind(domainId, operatorId).run();
   },
   async updateDomainVerified(db, domainId, verified) {
-    await db
-      .prepare("UPDATE operator_domains SET verified = ?, updated_at = ? WHERE id = ?")
-      .bind(verified ? 1 : 0, nowIso(), domainId)
-      .run();
+    await db.prepare("UPDATE domains SET verified = ?, updated_at = ? WHERE id = ?").bind(verified ? 1 : 0, nowIso(), domainId).run();
   },
   async getDomainById(db, domainId) {
-    return db.prepare("SELECT * FROM operator_domains WHERE id = ? AND deleted_at IS NULL").bind(domainId).first();
+    return db.prepare("SELECT * FROM domains WHERE id = ? AND deleted_at IS NULL").bind(domainId).first();
   },
   async listExtraConfigs(db, operatorId, limit = 5, offset = 0) {
     return db
       .prepare("SELECT * FROM extra_configs WHERE operator_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at LIMIT ? OFFSET ?")
       .bind(operatorId, limit, offset)
+      .all();
+  },
+  async listEnabledExtras(db, operatorId) {
+    return db
+      .prepare("SELECT * FROM extra_configs WHERE operator_id = ? AND deleted_at IS NULL AND enabled = 1 ORDER BY sort_order, created_at")
+      .bind(operatorId)
       .all();
   },
   async countExtraConfigs(db, operatorId) {
@@ -355,7 +495,7 @@ const D1 = {
   async createExtraConfig(db, operatorId, title, content) {
     await db
       .prepare(
-        "INSERT INTO extra_configs (id, operator_id, title, content, is_enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, ?, ?)"
+        "INSERT INTO extra_configs (id, operator_id, title, content, enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, ?, ?)"
       )
       .bind(crypto.randomUUID(), operatorId, title || null, content, nowIso(), nowIso())
       .run();
@@ -368,7 +508,7 @@ const D1 = {
   },
   async setExtraEnabled(db, operatorId, configId, enabled) {
     await db
-      .prepare("UPDATE extra_configs SET is_enabled = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
+      .prepare("UPDATE extra_configs SET enabled = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
       .bind(enabled ? 1 : 0, nowIso(), configId, operatorId)
       .run();
   },
@@ -391,29 +531,83 @@ const D1 = {
       .bind(...values, nowIso(), operatorId)
       .run();
   },
-  async getShareLinkByToken(db, token) {
+  async listUpstreams(db, operatorId) {
     return db
-      .prepare("SELECT * FROM share_links WHERE public_token = ? AND is_active = 1 AND revoked_at IS NULL")
-      .bind(token)
-      .first();
+      .prepare("SELECT * FROM operator_upstreams WHERE operator_id = ? AND enabled = 1 ORDER BY priority DESC, created_at DESC")
+      .bind(operatorId)
+      .all();
   },
-  async getShareLinkByOperator(db, operatorId) {
+  async listUpstreamsAll(db, operatorId) {
+    return db.prepare("SELECT * FROM operator_upstreams WHERE operator_id = ? ORDER BY priority DESC, created_at DESC").bind(operatorId).all();
+  },
+  async createUpstream(db, operatorId, payload) {
+    await db
+      .prepare(
+        "INSERT INTO operator_upstreams (id, operator_id, url, enabled, weight, priority, headers_json, format_hint, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+      .bind(
+        crypto.randomUUID(),
+        operatorId,
+        payload.url,
+        payload.enabled ? 1 : 0,
+        payload.weight ?? 1,
+        payload.priority ?? 0,
+        payload.headers_json || null,
+        payload.format_hint || null,
+        nowIso(),
+        nowIso()
+      )
+      .run();
+  },
+  async updateUpstream(db, operatorId, upstreamId, patch) {
+    const fields = Object.keys(patch);
+    if (!fields.length) return;
+    const setClause = fields.map((field) => `${field} = ?`).join(", ");
+    const values = fields.map((field) => patch[field]);
+    await db
+      .prepare(`UPDATE operator_upstreams SET ${setClause}, updated_at = ? WHERE id = ? AND operator_id = ?`)
+      .bind(...values, nowIso(), upstreamId, operatorId)
+      .run();
+  },
+  async listCustomerLinks(db, operatorId) {
+    return db.prepare("SELECT * FROM customer_links WHERE operator_id = ? ORDER BY created_at DESC").bind(operatorId).all();
+  },
+  async getCustomerLinkByToken(db, token) {
+    return db.prepare("SELECT * FROM customer_links WHERE public_token = ? AND enabled = 1 AND revoked_at IS NULL").bind(token).first();
+  },
+  async getCustomerLinkById(db, operatorId, id) {
+    return db.prepare("SELECT * FROM customer_links WHERE id = ? AND operator_id = ?").bind(id, operatorId).first();
+  },
+  async getPrimaryCustomerLink(db, operatorId) {
     return db
-      .prepare("SELECT * FROM share_links WHERE operator_id = ? AND is_active = 1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1")
+      .prepare("SELECT * FROM customer_links WHERE operator_id = ? AND enabled = 1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1")
       .bind(operatorId)
       .first();
   },
-  async rotateShareLink(db, operatorId) {
+  async createCustomerLink(db, operatorId, label, overrides) {
+    const id = crypto.randomUUID();
+    const token = crypto.randomUUID();
+    await db
+      .prepare(
+        "INSERT INTO customer_links (id, operator_id, public_token, label, enabled, overrides_json, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)"
+      )
+      .bind(id, operatorId, token, label || null, overrides ? JSON.stringify(overrides) : null, nowIso(), nowIso())
+      .run();
+    return this.getCustomerLinkById(db, operatorId, id);
+  },
+  async rotateCustomerLink(db, operatorId, id) {
     const now = nowIso();
     await db
-      .prepare("UPDATE share_links SET is_active = 0, revoked_at = ?, updated_at = ? WHERE operator_id = ? AND is_active = 1")
-      .bind(now, now, operatorId)
+      .prepare("UPDATE customer_links SET enabled = 0, revoked_at = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
+      .bind(now, now, id, operatorId)
       .run();
+    return this.createCustomerLink(db, operatorId, null, null);
+  },
+  async updateCustomerLinkOverrides(db, operatorId, id, overrides) {
     await db
-      .prepare("INSERT INTO share_links (id, operator_id, public_token, is_active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)")
-      .bind(crypto.randomUUID(), operatorId, crypto.randomUUID(), now, now)
+      .prepare("UPDATE customer_links SET overrides_json = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
+      .bind(overrides ? JSON.stringify(overrides) : null, nowIso(), id, operatorId)
       .run();
-    return this.getShareLinkByOperator(db, operatorId);
   },
   async upsertLastKnownGood(db, operatorId, token, bodyB64, headersJson) {
     await db
@@ -424,10 +618,34 @@ const D1 = {
       .run();
   },
   async getLastKnownGood(db, operatorId, token) {
-    return db
-      .prepare("SELECT * FROM last_known_good WHERE operator_id = ? AND public_token = ?")
-      .bind(operatorId, token)
-      .first();
+    return db.prepare("SELECT * FROM last_known_good WHERE operator_id = ? AND public_token = ?").bind(operatorId, token).first();
+  },
+  async createApiKey(db, operatorId, keyHash, scopesJson) {
+    await db
+      .prepare("INSERT INTO api_keys (id, operator_id, key_hash, scopes_json, created_at) VALUES (?, ?, ?, ?, ?)")
+      .bind(crypto.randomUUID(), operatorId, keyHash, scopesJson || null, nowIso())
+      .run();
+  },
+  async getApiKeyByHash(db, keyHash) {
+    return db.prepare("SELECT * FROM api_keys WHERE key_hash = ?").bind(keyHash).first();
+  },
+  async touchApiKey(db, keyHash) {
+    await db.prepare("UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?").bind(nowIso(), keyHash).run();
+  },
+  async createInviteCode(db, code, operatorId) {
+    await db
+      .prepare("INSERT INTO invite_codes (code, created_by, created_at) VALUES (?, ?, ?)")
+      .bind(code, operatorId, nowIso())
+      .run();
+  },
+  async getInviteCode(db, code) {
+    return db.prepare("SELECT * FROM invite_codes WHERE code = ?").bind(code).first();
+  },
+  async useInviteCode(db, code, operatorId) {
+    await db
+      .prepare("UPDATE invite_codes SET used_by = ?, used_at = ? WHERE code = ? AND used_at IS NULL")
+      .bind(operatorId, nowIso(), code)
+      .run();
   },
   async logAudit(db, payload) {
     const id = crypto.randomUUID();
@@ -450,26 +668,22 @@ const D1 = {
       .run();
   },
   async listAuditLogs(db, operatorId, limit = 5) {
-    return db
-      .prepare("SELECT * FROM audit_logs WHERE operator_id = ? ORDER BY created_at DESC LIMIT ?")
-      .bind(operatorId, limit)
-      .all();
+    return db.prepare("SELECT * FROM audit_logs WHERE operator_id = ? ORDER BY created_at DESC LIMIT ?").bind(operatorId, limit).all();
   },
   async bumpRateLimit(db, key, windowMs, max) {
     const now = Date.now();
     const existing = await db.prepare("SELECT * FROM rate_limits WHERE key = ?").bind(key).first();
     if (!existing || now - existing.window_start > windowMs) {
       await db
-        .prepare("INSERT INTO rate_limits (key, count, window_start, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET count = excluded.count, window_start = excluded.window_start, updated_at = excluded.updated_at")
+        .prepare(
+          "INSERT INTO rate_limits (key, count, window_start, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET count = excluded.count, window_start = excluded.window_start, updated_at = excluded.updated_at"
+        )
         .bind(key, 1, now, nowIso())
         .run();
       return true;
     }
     const nextCount = existing.count + 1;
-    await db
-      .prepare("UPDATE rate_limits SET count = ?, updated_at = ? WHERE key = ?")
-      .bind(nextCount, nowIso(), key)
-      .run();
+    await db.prepare("UPDATE rate_limits SET count = ?, updated_at = ? WHERE key = ?").bind(nextCount, nowIso(), key).run();
     return nextCount <= max;
   },
 };
@@ -481,15 +695,16 @@ const OperatorService = {
   async ensureOperator(db, telegramUser, env) {
     let operator = await D1.getOperatorByTelegramId(db, telegramUser.id);
     if (!operator && isAdmin(telegramUser.id, env)) {
-      operator = await D1.createOperator(db, telegramUser.id, telegramUser.first_name || telegramUser.username, "admin");
+      operator = await D1.createOperator(db, telegramUser.id, telegramUser.first_name || telegramUser.username, "admin", "active");
     }
-    if (!operator || operator.status !== "active") return null;
+    if (!operator) return null;
+    if (operator.status !== "active") return operator;
     await D1.touchOperator(db, operator.id);
     return operator;
   },
   async getShareLink(db, operator, baseUrl) {
     const settings = await D1.getSettings(db, operator.id);
-    const share = await D1.getShareLinkByOperator(db, operator.id);
+    const share = await D1.getPrimaryCustomerLink(db, operator.id);
     let hostBase = baseUrl;
     if (settings?.active_domain_id) {
       const domain = await D1.getDomainById(db, settings.active_domain_id);
@@ -500,16 +715,25 @@ const OperatorService = {
 };
 
 const SubscriptionAssembler = {
-  async assemble(env, db, operatorId, token, request, requestId) {
+  async assemble(env, db, operatorId, token, request, requestId, customerLink) {
     const settings = await D1.getSettings(db, operatorId);
-    const rules = await D1.getRules(db, operatorId);
-    const extras = await D1.listExtraConfigs(db, operatorId, APP.maxOutputLines, 0);
+    const baseRules = await D1.getRules(db, operatorId);
+    const overrides = safeParseJson(customerLink?.overrides_json, {});
+    const rules = { ...baseRules, ...overrides };
+    const extras = await D1.listEnabledExtras(db, operatorId);
+    const selectedExtras = overrides?.extras?.length
+      ? (extras?.results || []).filter((item) => overrides.extras.includes(item.id))
+      : (extras?.results || []);
 
-    const upstreamUrl = this.resolveUpstream(settings?.upstream_url, env);
-    const upstreamResponse = await this.fetchUpstream(upstreamUrl);
-    const upstreamText = this.decodeSubscription(upstreamResponse.body, upstreamResponse.isBase64);
+    const upstreams = await D1.listUpstreams(db, operatorId);
+    const allowlist = parseCommaList(settings?.upstream_allowlist);
+    const denylist = parseCommaList(settings?.upstream_denylist);
 
-    if (!upstreamResponse.ok || !isValidSubscriptionText(upstreamText)) {
+    const upstreamPayloads = await this.fetchUpstreams(upstreams?.results || [], allowlist, denylist);
+    const selected = this.selectUpstreamsByPolicy(upstreamPayloads, rules?.merge_policy || "append");
+    const extrasContent = selectedExtras.map((item) => item.content).join("\n");
+
+    if (!selected.ok) {
       await D1.updateSettings(db, operatorId, { last_upstream_status: "invalid", last_upstream_at: nowIso() });
       await D1.logAudit(db, {
         operator_id: operatorId,
@@ -518,7 +742,7 @@ const SubscriptionAssembler = {
         country: request.headers.get("cf-ipcountry"),
         user_agent: request.headers.get("user-agent"),
         request_path: new URL(request.url).pathname,
-        response_status: upstreamResponse.status,
+        response_status: 502,
         meta_json: JSON.stringify({ reason: "upstream_invalid", request_id: requestId }),
       });
       await AuditService.notifyOperator(env, settings, `⚠️ آپ‌استریم نامعتبر بود برای <b>${safeHtml(settings?.branding || "اپراتور")}</b>`);
@@ -527,69 +751,101 @@ const SubscriptionAssembler = {
 
     await D1.updateSettings(db, operatorId, { last_upstream_status: "ok", last_upstream_at: nowIso() });
 
-    const extrasContent = (extras?.results || [])
-      .filter((item) => item.is_enabled)
-      .map((item) => item.content)
-      .join("\n");
-
-    const merged = this.mergeContent(upstreamText, extrasContent, rules);
+    const merged = this.mergeContent(selected.text, extrasContent, rules);
     const processed = this.applyRules(merged, rules);
-    const limited = limitOutput(processed.split("\n"));
-    const encoded = utf8SafeEncode(limited.join("\n"));
+    const limited = limitOutput(processed.split("\n"), rules?.limit_lines || APP.maxOutputLines, rules?.limit_bytes || APP.maxOutputBytes);
+    const outputBody = limited.join("\n");
+    const formatted = rules?.output_format === "plain" ? outputBody : utf8SafeEncode(outputBody);
 
     return {
-      body: encoded,
+      body: formatted,
       headers: {
         ...DEFAULT_HEADERS,
-        ...(upstreamResponse.subscriptionUserinfo ? { "subscription-userinfo": upstreamResponse.subscriptionUserinfo } : {}),
+        ...(selected.subscriptionUserinfo ? { "subscription-userinfo": selected.subscriptionUserinfo } : {}),
       },
       valid: true,
     };
   },
-  resolveUpstream(input, env) {
-    if (!input) return "";
-    if (/^https?:\/\//i.test(input)) return input;
-    if (env.UPSTREAM_BASE) return `${env.UPSTREAM_BASE.replace(/\/$/, "")}/${input}`;
-    if (env.UPSTREAM_HOST) return `https://${env.UPSTREAM_HOST.replace(/\/$/, "")}/${input}`;
-    return input;
-  },
-  async fetchUpstream(upstreamUrl) {
-    if (!upstreamUrl) return { ok: false, status: 400, body: "", subscriptionUserinfo: null, isBase64: false };
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), APP.upstreamTimeoutMs);
-    const headers = { "user-agent": "v2rayNG" };
-    try {
-      const res = await fetch(upstreamUrl, { cf: { cacheTtl: 0 }, signal: controller.signal, headers });
-      const text = await res.text();
-      clearTimeout(timeout);
-      if (!res.ok) return { ok: false, status: res.status, body: text, subscriptionUserinfo: null, isBase64: false };
-      return {
-        ok: res.ok,
-        status: res.status,
-        body: text,
-        subscriptionUserinfo: res.headers.get("subscription-userinfo"),
-        isBase64: looksLikeBase64(text),
-      };
-    } catch (err) {
-      clearTimeout(timeout);
-      Logger.warn("Upstream fetch failed", { error: err?.message });
+  async fetchUpstreams(upstreams, allowlist, denylist) {
+    const results = [];
+    for (const upstream of upstreams) {
+      const validation = assertSafeUpstream(upstream.url, allowlist, denylist);
+      if (!validation.ok) {
+        results.push({ ok: false, status: 400, body: "", subscriptionUserinfo: null, isBase64: false, error: validation.error, upstream });
+        continue;
+      }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), APP.upstreamTimeoutMs);
       try {
-        await new Promise((resolve) => setTimeout(resolve, 200 + Math.random() * 200));
-        const res = await fetch(upstreamUrl, { cf: { cacheTtl: 0 }, headers });
+        const headers = upstream.headers_json ? JSON.parse(upstream.headers_json) : { "user-agent": "v2rayNG" };
+        const res = await fetchWithRedirects(
+          upstream.url,
+          { cf: { cacheTtl: 0 }, signal: controller.signal, headers },
+          APP.maxRedirects,
+          (nextUrl) => assertSafeUpstream(nextUrl, allowlist, denylist)
+        );
         const text = await res.text();
-        if (!res.ok) return { ok: false, status: res.status, body: text, subscriptionUserinfo: null, isBase64: false };
-        return {
+        if (new TextEncoder().encode(text).length > APP.maxOutputBytes) {
+          results.push({ ok: false, status: 413, body: "", subscriptionUserinfo: null, isBase64: false, error: "too_large", upstream });
+          continue;
+        }
+        clearTimeout(timeout);
+        results.push({
           ok: res.ok,
           status: res.status,
           body: text,
           subscriptionUserinfo: res.headers.get("subscription-userinfo"),
           isBase64: looksLikeBase64(text),
-        };
-      } catch (retryErr) {
-        Logger.warn("Upstream retry failed", { error: retryErr?.message });
-        return { ok: false, status: 502, body: "", subscriptionUserinfo: null, isBase64: false };
+          upstream,
+        });
+      } catch (err) {
+        clearTimeout(timeout);
+        Logger.warn("Upstream fetch failed", { error: err?.message, upstream: redactUrlForLog(upstream.url) });
+        results.push({ ok: false, status: 502, body: "", subscriptionUserinfo: null, isBase64: false, error: "fetch_failed", upstream });
       }
     }
+    return results;
+  },
+  selectUpstreamsByPolicy(results, policy) {
+    const valid = results.filter((item) => item.ok && isValidSubscriptionText(this.decodeSubscription(item.body, item.isBase64)));
+    if (!valid.length) return { ok: false, text: "", subscriptionUserinfo: null };
+    if (policy === "upstream_only") {
+      const first = valid[0];
+      return { ok: true, text: this.decodeSubscription(first.body, first.isBase64), subscriptionUserinfo: first.subscriptionUserinfo };
+    }
+    if (policy === "failover") {
+      const first = valid[0];
+      return { ok: true, text: this.decodeSubscription(first.body, first.isBase64), subscriptionUserinfo: first.subscriptionUserinfo };
+    }
+    if (policy === "round_robin") {
+      const lists = valid.map((item) => this.decodeSubscription(item.body, item.isBase64).split("\n").filter(Boolean));
+      const max = Math.max(...lists.map((list) => list.length));
+      const merged = [];
+      for (let i = 0; i < max; i += 1) {
+        for (const list of lists) {
+          if (list[i]) merged.push(list[i]);
+        }
+      }
+      return { ok: true, text: merged.join("\n"), subscriptionUserinfo: valid[0].subscriptionUserinfo };
+    }
+    if (policy === "weighted") {
+      const weightedLists = [];
+      for (const item of valid) {
+        const weight = Math.max(1, item.upstream.weight || 1);
+        const list = this.decodeSubscription(item.body, item.isBase64).split("\n").filter(Boolean);
+        for (let i = 0; i < weight; i += 1) weightedLists.push(list);
+      }
+      const max = Math.max(...weightedLists.map((list) => list.length));
+      const merged = [];
+      for (let i = 0; i < max; i += 1) {
+        for (const list of weightedLists) {
+          if (list[i]) merged.push(list[i]);
+        }
+      }
+      return { ok: true, text: merged.join("\n"), subscriptionUserinfo: valid[0].subscriptionUserinfo };
+    }
+    const combined = valid.map((item) => this.decodeSubscription(item.body, item.isBase64)).join("\n");
+    return { ok: true, text: combined, subscriptionUserinfo: valid[0].subscriptionUserinfo };
   },
   decodeSubscription(body, isBase64) {
     if (!body) return "";
@@ -618,7 +874,7 @@ const SubscriptionAssembler = {
       .filter(Boolean);
     let processed = lines;
     if (rules?.sanitize !== 0) processed = sanitizeLines(processed, blocked);
-    if (rules?.dedupe !== 0) processed = Array.from(new Set(processed));
+    if (rules?.dedupe !== 0) processed = stableDedupe(processed);
     if (rules?.naming_mode === "prefix" && rules?.naming_prefix) {
       processed = processed.map((line) => `${rules.naming_prefix}${line}`);
     }
@@ -644,6 +900,32 @@ const AuditService = {
     } catch (err) {
       Logger.warn("Notify Telegram failed", { error: err?.message });
     }
+  },
+};
+
+const AuthService = {
+  async getAuthContext(request, env, db) {
+    const authHeader = request.headers.get("authorization") || "";
+    if (authHeader.startsWith("Bearer ")) {
+      const token = authHeader.replace("Bearer ", "").trim();
+      if (!token || !env.SESSION_SECRET) return null;
+      const payload = await verifySession(token, env.SESSION_SECRET);
+      if (!payload || payload.exp < Math.floor(Date.now() / 1000)) return null;
+      const operator = await D1.getOperatorById(db, payload.sub);
+      if (!operator || operator.status !== "active") return null;
+      return { operator, tokenType: "session" };
+    }
+    const apiKey = request.headers.get("x-api-key");
+    if (apiKey) {
+      const hash = await hashApiKey(apiKey);
+      const key = await D1.getApiKeyByHash(db, hash);
+      if (!key) return null;
+      const operator = await D1.getOperatorById(db, key.operator_id);
+      if (!operator || operator.status !== "active") return null;
+      await D1.touchApiKey(db, hash);
+      return { operator, tokenType: "api_key" };
+    }
+    return null;
   },
 };
 
@@ -687,6 +969,11 @@ const Telegram = {
       return new Response("ok");
     }
 
+    if (operator.status === "pending") {
+      await this.sendMessage(env, user.id, "⏳ حساب شما در انتظار تایید مدیر است.");
+      return new Response("ok");
+    }
+
     if (update.message) {
       return this.handleMessage(env, db, operator, update.message);
     }
@@ -708,7 +995,7 @@ const Telegram = {
     if (!text.startsWith("/") && settings?.pending_action) {
       const action = settings.pending_action;
       if (action === "set_upstream") {
-        await D1.updateSettings(db, operator.id, { upstream_url: text });
+        await D1.createUpstream(db, operator.id, { url: text, enabled: true, weight: 1, priority: 1 });
         await D1.setPendingAction(db, operator.id, null, null);
         await D1.logAudit(db, {
           operator_id: operator.id,
@@ -731,7 +1018,7 @@ const Telegram = {
         await D1.setPendingAction(db, operator.id, null, null);
         await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:domain" });
         await AuditService.notifyOperator(env, settings, "🧊 دامنه بروزرسانی شد.");
-        const token = latest?.verification_token ? `\nتوکن تایید: <code>${safeHtml(latest.verification_token)}</code>` : "";
+        const token = latest?.token ? `\nتوکن تایید: <code>${safeHtml(latest.token)}</code>` : "";
         await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد.${token}`);
         return new Response("ok");
       }
@@ -757,8 +1044,12 @@ const Telegram = {
         await this.sendMessage(env, message.chat.id, "📌 لطفاً لینک آپ‌استریم را بفرستید.");
         return new Response("ok");
       }
-      await D1.updateSettings(db, operator.id, { upstream_url: value });
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:upstream_url", meta_json: JSON.stringify({ upstream: redactUrlForLog(value) }) });
+      await D1.createUpstream(db, operator.id, { url: value, enabled: true, weight: 1, priority: 1 });
+      await D1.logAudit(db, {
+        operator_id: operator.id,
+        event_type: "settings_update:upstream_url",
+        meta_json: JSON.stringify({ upstream: redactUrlForLog(value) }),
+      });
       await AuditService.notifyOperator(env, settings, "🧊 آپ‌استریم بروزرسانی شد.");
       await this.sendMessage(env, message.chat.id, "✅ لینک آپ‌استریم ذخیره شد.");
       return new Response("ok");
@@ -780,7 +1071,7 @@ const Telegram = {
       if (latest) await D1.setDomainActive(db, operator.id, latest.id);
       await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:domain", meta_json: JSON.stringify({ domain }) });
       await AuditService.notifyOperator(env, settings, "🧊 دامنه بروزرسانی شد.");
-      const token = latest?.verification_token ? `\nتوکن تایید: <code>${safeHtml(latest.verification_token)}</code>` : "";
+      const token = latest?.token ? `\nتوکن تایید: <code>${safeHtml(latest.token)}</code>` : "";
       await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد.${token}`);
       return new Response("ok");
     }
@@ -834,7 +1125,7 @@ const Telegram = {
     if (text.startsWith("/set_rules")) {
       const patch = parseRulesArgs(text);
       if (!Object.keys(patch).length) {
-        await this.sendMessage(env, message.chat.id, "❗️فرمت: /set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam");
+        await this.sendMessage(env, message.chat.id, "❗️فرمت: /set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam format=base64");
         return new Response("ok");
       }
       await D1.updateRules(db, operator.id, patch);
@@ -848,7 +1139,8 @@ const Telegram = {
       return new Response("ok");
     }
     if (text.startsWith("/rotate")) {
-      const share = await D1.rotateShareLink(db, operator.id);
+      const primary = await D1.getPrimaryCustomerLink(db, operator.id);
+      const share = primary ? await D1.rotateCustomerLink(db, operator.id, primary.id) : await D1.createCustomerLink(db, operator.id, null, null);
       await D1.logAudit(db, { operator_id: operator.id, event_type: "link_rotate" });
       const link = await OperatorService.getShareLink(db, operator, env.BASE_URL || "");
       await this.sendMessage(env, message.chat.id, `✅ لینک جدید: <code>${safeHtml(link)}</code>`);
@@ -884,7 +1176,7 @@ const Telegram = {
       }
       const existing = await D1.getOperatorByTelegramId(db, targetId);
       if (!existing) {
-        await D1.createOperator(db, targetId, "Operator", "operator");
+        await D1.createOperator(db, targetId, "Operator", "operator", "active");
       }
       await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_add_operator" });
       await this.sendMessage(env, message.chat.id, "✅ اپراتور اضافه شد.");
@@ -994,7 +1286,7 @@ const Telegram = {
   async buildPanel(db, operator, env) {
     const settings = await D1.getSettings(db, operator.id);
     const domains = await D1.listDomains(db, operator.id);
-    const activeDomain = (domains?.results || []).find((item) => item.is_active);
+    const activeDomain = (domains?.results || []).find((item) => item.active);
     const shareLink = await OperatorService.getShareLink(db, operator, env.BASE_URL || "");
     const text = `
 ${GLASS} <b>پنل اپراتور</b>
@@ -1077,7 +1369,7 @@ Merge policy: ${safeHtml(rules?.merge_policy || "append")}
     const extras = await D1.listExtraConfigs(db, operator.id, limit, offset);
     const total = await D1.countExtraConfigs(db, operator.id);
     const list = (extras?.results || [])
-      .map((item) => `• ${safeHtml(item.title || "افزودنی")} (${safeHtml(item.id)}) ${item.is_enabled ? "✅" : "⛔️"}`)
+      .map((item) => `• ${safeHtml(item.title || "افزودنی")} (${safeHtml(item.id)}) ${item.enabled ? "✅" : "⛔️"}`)
       .join("\n");
     const text = `
 ${GLASS} <b>افزودنی‌ها</b>
@@ -1093,7 +1385,7 @@ ${list || "فعلاً موردی ثبت نشده."}
     const keyboard = {
       inline_keyboard: [
         ...(extras?.results || []).map((item) => [
-          { text: GLASS_BTN(item.is_enabled ? "غیرفعال" : "فعال"), callback_data: utf8SafeEncode(JSON.stringify({ action: "toggle_extra", id: item.id, enabled: !item.is_enabled })) },
+          { text: GLASS_BTN(item.enabled ? "غیرفعال" : "فعال"), callback_data: utf8SafeEncode(JSON.stringify({ action: "toggle_extra", id: item.id, enabled: !item.enabled })) },
           { text: GLASS_BTN("حذف"), callback_data: utf8SafeEncode(JSON.stringify({ action: "delete_extra", id: item.id })) },
         ]),
         [
@@ -1116,14 +1408,15 @@ ${GLASS} <b>قوانین اشتراک</b>
 پاکسازی: ${rules?.sanitize ? "فعال" : "غیرفعال"}
 پیشوند نام: ${safeHtml(rules?.naming_prefix || "-")}
 کلیدواژه‌های مسدود: ${safeHtml(rules?.blocked_keywords || "-")}
+خروجی: ${safeHtml(rules?.output_format || "base64")}
 
 برای تغییر سریع از دکمه‌ها یا دستور زیر استفاده کنید:
-<code>/set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam</code>
+<code>/set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam format=base64</code>
     `.trim();
     const keyboard = {
       inline_keyboard: [
         [
-          { text: GLASS_BTN("ادغام + حذف تکراری"), callback_data: utf8SafeEncode(JSON.stringify({ action: "set_rules", patch: { merge_policy: "append_dedupe", dedupe: 1 } })) },
+          { text: GLASS_BTN("ادغام + حذف تکراری"), callback_data: utf8SafeEncode(JSON.stringify({ action: "set_rules", patch: { merge_policy: "append", dedupe: 1 } })) },
           { text: GLASS_BTN("فقط اپ‌استریم"), callback_data: utf8SafeEncode(JSON.stringify({ action: "set_rules", patch: { merge_policy: "upstream_only" } })) },
         ],
         [
@@ -1171,6 +1464,9 @@ const Router = {
     if (request.method === "POST" && url.pathname === "/webhook") {
       return Telegram.handleWebhook(request, env);
     }
+    if (request.method === "POST" && url.pathname === "/auth/telegram") {
+      return this.handleTelegramLogin(request, env);
+    }
     if (request.method === "GET" && url.pathname.startsWith("/sub/")) {
       const token = url.pathname.split("/").pop();
       return this.handleSubscription(request, env, token);
@@ -1184,17 +1480,149 @@ const Router = {
     if (request.method === "GET" && url.pathname === "/health") {
       return this.handleHealth(env);
     }
+    if (request.method === "GET" && url.pathname === "/api/v1/health/full") {
+      return this.handleHealthFull(env);
+    }
+    if (url.pathname.startsWith("/api/v1/")) {
+      return this.handleApi(request, env);
+    }
     if (request.method === "GET" && url.pathname === "/") {
       return this.handleLanding(request, env);
     }
     return new Response("not found", { status: 404 });
   },
+  async handleTelegramLogin(request, env) {
+    if (!env.TELEGRAM_TOKEN || !env.SESSION_SECRET) {
+      return jsonResponse({ ok: false, error: "missing_env" }, 500);
+    }
+    const body = await parseJsonBody(request);
+    if (!body) return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+    const ok = await validateTelegramLogin(body, env.TELEGRAM_TOKEN);
+    if (!ok) return jsonResponse({ ok: false, error: "invalid_auth" }, 403);
+    const telegramId = body.id;
+    const displayName = body.first_name || body.username || "Operator";
+    let operator = await D1.getOperatorByTelegramId(env.DB, telegramId);
+    if (!operator) {
+      let status = "pending";
+      if (isAdmin(telegramId, env)) status = "active";
+      if (body.invite_code) {
+        const invite = await D1.getInviteCode(env.DB, body.invite_code);
+        if (!invite || invite.used_at) return jsonResponse({ ok: false, error: "invalid_invite" }, 403);
+        operator = await D1.createOperator(env.DB, telegramId, displayName, "operator", status);
+        await D1.useInviteCode(env.DB, body.invite_code, operator.id);
+      } else {
+        operator = await D1.createOperator(env.DB, telegramId, displayName, "operator", status);
+      }
+    }
+    const payload = {
+      sub: operator.id,
+      role: operator.role,
+      telegram_user_id: operator.telegram_user_id,
+      exp: Math.floor(Date.now() / 1000) + APP.sessionTtlSec,
+    };
+    const token = await signSession(payload, env.SESSION_SECRET);
+    return jsonResponse({ ok: true, token, status: operator.status });
+  },
+  async handleApi(request, env) {
+    const ctx = await AuthService.getAuthContext(request, env, env.DB);
+    if (!ctx) return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+    const { operator } = ctx;
+    const url = new URL(request.url);
+    const path = url.pathname.replace("/api/v1", "");
+    if (request.method === "GET" && path === "/operators/me/upstreams") {
+      const data = await D1.listUpstreamsAll(env.DB, operator.id);
+      return jsonResponse({ ok: true, data: data?.results || [] });
+    }
+    if (request.method === "POST" && path === "/operators/me/upstreams") {
+      const body = await parseJsonBody(request);
+      if (!body?.url) return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+      await D1.createUpstream(env.DB, operator.id, body);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_upstream_create" });
+      return jsonResponse({ ok: true });
+    }
+    if (request.method === "POST" && path === "/operators/me/extras") {
+      const body = await parseJsonBody(request);
+      if (!body?.content) return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+      await D1.createExtraConfig(env.DB, operator.id, body.title, body.content);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_extra_create" });
+      return jsonResponse({ ok: true });
+    }
+    if (request.method === "POST" && path === "/operators/me/customer-links") {
+      const body = await parseJsonBody(request);
+      const link = await D1.createCustomerLink(env.DB, operator.id, body?.label, body?.overrides);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_customer_link_create" });
+      return jsonResponse({ ok: true, data: link });
+    }
+    if (request.method === "GET" && path === "/operators/me/customer-links") {
+      const links = await D1.listCustomerLinks(env.DB, operator.id);
+      return jsonResponse({ ok: true, data: links?.results || [] });
+    }
+    if (request.method === "POST" && path.startsWith("/operators/me/customer-links/") && path.endsWith("/rotate")) {
+      const id = path.split("/")[4];
+      if (!id) return jsonResponse({ ok: false, error: "missing_id" }, 400);
+      const link = await D1.rotateCustomerLink(env.DB, operator.id, id);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_customer_link_rotate" });
+      return jsonResponse({ ok: true, data: link });
+    }
+    if (request.method === "PATCH" && path === "/operators/me/rules") {
+      const body = await parseJsonBody(request);
+      if (!body) return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+      await D1.updateRules(env.DB, operator.id, body);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_rules_update" });
+      return jsonResponse({ ok: true });
+    }
+    if (request.method === "GET" && path === "/operators/me/domains") {
+      const domains = await D1.listDomains(env.DB, operator.id);
+      return jsonResponse({ ok: true, data: domains?.results || [] });
+    }
+    if (request.method === "POST" && path === "/operators/me/api-keys") {
+      const body = await parseJsonBody(request);
+      const rawKey = body?.key || crypto.randomUUID();
+      const keyHash = await hashApiKey(rawKey);
+      await D1.createApiKey(env.DB, operator.id, keyHash, body?.scopes ? JSON.stringify(body.scopes) : null);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_key_create" });
+      return jsonResponse({ ok: true, key: rawKey });
+    }
+    if (request.method === "POST" && path === "/admin/invite-codes") {
+      if (!isAdmin(operator.telegram_user_id, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+      const code = crypto.randomUUID().split("-")[0];
+      await D1.createInviteCode(env.DB, code, operator.id);
+      return jsonResponse({ ok: true, code });
+    }
+    if (request.method === "POST" && path.startsWith("/admin/operators/") && path.endsWith("/approve")) {
+      if (!isAdmin(operator.telegram_user_id, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+      const id = path.split("/")[3];
+      await D1.updateOperatorStatus(env.DB, id, "active");
+      return jsonResponse({ ok: true });
+    }
+    return jsonResponse({ ok: false, error: "not_found" }, 404);
+  },
   async handleSubscription(request, env, token) {
     const requestId = crypto.randomUUID();
     const cacheKey = `sub:${token}`;
     const db = env.DB;
-    const link = await D1.getShareLinkByToken(db, token);
+    const link = await D1.getCustomerLinkByToken(db, token);
     if (!link) return new Response("not found", { status: 404 });
+
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    const settings = await D1.getSettings(db, link.operator_id);
+    const quotas = safeParseJson(settings?.quotas_json, {});
+    const perIp = quotas?.per_ip ?? APP.rateLimitMax;
+    const perToken = quotas?.per_token ?? APP.rateLimitMax;
+    const perOperator = quotas?.per_operator ?? APP.rateLimitMax * 10;
+
+    if (!rateLimit(`sub-ip:${ip}`)) {
+      const ok = await D1.bumpRateLimit(db, `sub-ip:${ip}`, APP.rateLimitWindowMs, perIp);
+      if (!ok) return new Response("rate limit", { status: 429 });
+    }
+    if (!rateLimit(`sub-token:${token}`)) {
+      const ok = await D1.bumpRateLimit(db, `sub-token:${token}`, APP.rateLimitWindowMs, perToken);
+      if (!ok) return new Response("rate limit", { status: 429 });
+    }
+    if (!rateLimit(`sub-op:${link.operator_id}`)) {
+      const ok = await D1.bumpRateLimit(db, `sub-op:${link.operator_id}`, APP.rateLimitWindowMs, perOperator);
+      if (!ok) return new Response("rate limit", { status: 429 });
+    }
 
     const cached = getCachedSub(cacheKey);
     if (cached) {
@@ -1233,7 +1661,7 @@ const Router = {
       return new Response(body, { headers: { ...cachedHeaders, "x-request-id": requestId } });
     }
 
-    const { body, headers, valid } = await SubscriptionAssembler.assemble(env, db, link.operator_id, token, request, requestId);
+    const { body, headers, valid } = await SubscriptionAssembler.assemble(env, db, link.operator_id, token, request, requestId, link);
     const responseHeadersBase = { ...headers, "content-disposition": `inline; filename=sub_${token}.txt` };
     const clientHeaders = { ...responseHeadersBase, "x-request-id": requestId, "cache-control": "no-store" };
     const cacheHeaders = { ...responseHeadersBase, "cache-control": "max-age=60" };
@@ -1252,7 +1680,6 @@ const Router = {
         response_status: 200,
         meta_json: JSON.stringify({ cache: "origin", request_id: requestId }),
       });
-      const settings = await D1.getSettings(db, link.operator_id);
       if (settings?.notify_fetches !== 0) {
         const last = settings?.last_fetch_notify_at ? Date.parse(settings.last_fetch_notify_at) : 0;
         if (Date.now() - last > APP.notifyFetchIntervalMs) {
@@ -1300,7 +1727,7 @@ const Router = {
     const token = url.searchParams.get("token");
     if (!domainId || !token) return jsonResponse({ ok: false, error: "missing" }, 400);
     const domain = await D1.getDomainById(env.DB, domainId);
-    if (!domain || domain.verification_token !== token) return jsonResponse({ ok: false, error: "unauthorized" }, 403);
+    if (!domain || domain.token !== token) return jsonResponse({ ok: false, error: "unauthorized" }, 403);
     const doh = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain.domain)}&type=TXT`;
     const res = await fetch(doh, { headers: { accept: "application/dns-json" } });
     const data = await res.json();
@@ -1332,8 +1759,34 @@ const Router = {
     };
     return jsonResponse(payload);
   },
+  async handleHealthFull(env) {
+    let dbOk = true;
+    let operators = [];
+    let errors = [];
+    try {
+      await env.DB.prepare("SELECT 1").first();
+      const rows = await env.DB
+        .prepare("SELECT operator_id, last_upstream_status, last_upstream_at FROM operator_settings ORDER BY last_upstream_at DESC LIMIT 5")
+        .all();
+      operators = rows?.results || [];
+      const errRows = await env.DB.prepare("SELECT event_type, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 5").all();
+      errors = errRows?.results || [];
+    } catch {
+      dbOk = false;
+    }
+    const payload = {
+      status: "ok",
+      version: APP.version,
+      db: dbOk ? "ok" : "error",
+      cache: { memory: SUB_CACHE.size, last_good: LAST_GOOD_MEM.size },
+      last_upstream: operators,
+      last_errors: errors,
+    };
+    return jsonResponse(payload);
+  },
   handleLanding(request, env) {
     const base = getBaseUrl(request, env);
+    const botUsername = env.TELEGRAM_BOT_USERNAME || "";
     const html = `<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -1348,23 +1801,56 @@ const Router = {
     .glass-btn { display:inline-flex; align-items:center; gap:8px; padding:12px 20px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.3); background: rgba(255,255,255,0.1); color:#fff; text-decoration:none; }
     .grid { display:flex; flex-wrap:wrap; gap:12px; margin-top: 20px; }
     .muted { color: rgba(226,232,240,0.7); }
+    .panel { margin-top: 18px; padding: 16px; background: rgba(15,23,42,0.6); border-radius: 16px; }
+    input { width:100%; padding:10px 12px; border-radius: 12px; border:1px solid rgba(255,255,255,0.2); background: rgba(15,23,42,0.6); color: #fff; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
       <h1>پنل اشتراک برند برای اپراتورها</h1>
-      <p class="muted">این سرویس فقط برای اپراتورهاست و کاربران نهایی با ربات تعامل ندارند.</p>
+      <p class="muted">ورود از طریق Telegram Login Widget و کد دعوت مدیر.</p>
+      <div class="panel">
+        <div id="telegram-login"></div>
+        <p class="muted">کد دعوت (اختیاری)</p>
+        <input id="invite-code" placeholder="Invite code" />
+      </div>
       <div class="grid">
-        <a class="glass-btn" href="https://t.me/">🧊 ورود اپراتور</a>
+        <a class="glass-btn" href="https://t.me/${botUsername}">🧊 ورود از تلگرام</a>
         <a class="glass-btn" href="${base}/health">🧊 وضعیت سلامت</a>
       </div>
     </div>
   </div>
+  <script>
+    const inviteInput = document.getElementById('invite-code');
+    window.onTelegramAuth = async (user) => {
+      const payload = { ...user, invite_code: inviteInput.value || undefined };
+      const res = await fetch('${base}/auth/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.ok) {
+        alert('ورود موفق: ' + data.status);
+      } else {
+        alert('خطا: ' + data.error);
+      }
+    };
+  </script>
+  <script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="${botUsername}" data-size="large" data-userpic="false" data-onauth="onTelegramAuth(user)" data-request-access="write"></script>
 </body>
 </html>`;
     return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
   },
+};
+
+export const TestUtils = {
+  stableDedupe,
+  sanitizeLines,
+  limitOutput,
+  assertSafeUpstream,
+  SubscriptionAssembler,
 };
 
 export default {
