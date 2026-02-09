@@ -1,13 +1,13 @@
 /**
- * Cloudflare Worker: Personal Subscription Manager
+ * Cloudflare Worker: Operator Subscription Manager
  * Required env vars:
- * TELEGRAM_TOKEN, TELEGRAM_SECRET(optional), LOG_CHANNEL_ID, ADMIN_IDS,
+ * TELEGRAM_TOKEN, TELEGRAM_SECRET(optional), LOG_CHANNEL_ID(optional), ADMIN_IDS,
  * UPSTREAM_BASE(optional), UPSTREAM_HOST(optional), BASE_URL(optional)
  */
 
 const APP = {
-  name: "Haydenet Personal Sub Manager",
-  version: "1.0.0",
+  name: "Operator Subscription Manager",
+  version: "2.0.0",
   cacheTtlMs: 60_000,
   cacheMaxEntries: 1000,
   rateLimitWindowMs: 10_000,
@@ -27,7 +27,7 @@ const DEFAULT_HEADERS = {
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
 const SUB_CACHE = new Map();
-const LAST_GOOD = new Map();
+const LAST_GOOD_MEM = new Map();
 const RATE_LIMIT = new Map();
 
 const Logger = {
@@ -67,8 +67,6 @@ const safeHtml = (text) =>
     .replace(/\"/g, "&quot;")
     .replace(/'/g, "&#39;");
 
-const isValidDomain = (value) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(value);
-
 const nowIso = () => new Date().toISOString();
 
 const parseCommaList = (value) =>
@@ -80,12 +78,6 @@ const parseCommaList = (value) =>
 const isAdmin = (userId, env) => {
   const allow = new Set(parseCommaList(env.ADMIN_IDS));
   return allow.has(String(userId));
-};
-
-const isAllowedUser = (userId, env) => {
-  const allowList = parseCommaList(env.USER_ALLOWLIST || env.ALLOWLIST_IDS);
-  if (!allowList.length) return true;
-  return allowList.includes(String(userId));
 };
 
 const rateLimit = (key) => {
@@ -106,6 +98,8 @@ const getBaseUrl = (request, env) => {
   return `${url.protocol}//${url.host}`;
 };
 
+const isValidDomain = (value) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(value);
+
 const getCachedSub = (key) => {
   const entry = SUB_CACHE.get(key);
   if (!entry) return null;
@@ -121,12 +115,12 @@ const setCachedSub = (key, body, headers) => {
   SUB_CACHE.set(key, { body, headers, timestamp: Date.now() });
 };
 
-const setLastGood = (key, body, headers) => {
-  if (LAST_GOOD.size > APP.cacheMaxEntries) LAST_GOOD.clear();
-  LAST_GOOD.set(key, { body, headers, timestamp: Date.now() });
+const setLastGoodMem = (key, body, headers) => {
+  if (LAST_GOOD_MEM.size > APP.cacheMaxEntries) LAST_GOOD_MEM.clear();
+  LAST_GOOD_MEM.set(key, { body, headers, timestamp: Date.now() });
 };
 
-const getLastGood = (key) => LAST_GOOD.get(key);
+const getLastGoodMem = (key) => LAST_GOOD_MEM.get(key);
 
 const parseMessageText = (message) => message?.text?.trim() || "";
 
@@ -138,114 +132,173 @@ const decodeCallbackData = (data) => {
   }
 };
 
+const parseRulesArgs = (text) => {
+  const args = text.split(" ").slice(1);
+  const patch = {};
+  for (const arg of args) {
+    const [key, ...rest] = arg.split("=");
+    const value = rest.join("=");
+    if (!key || value === undefined) continue;
+    if (key === "merge") patch.merge_policy = value;
+    if (key === "dedupe") patch.dedupe = value === "1" ? 1 : 0;
+    if (key === "sanitize") patch.sanitize = value === "1" ? 1 : 0;
+    if (key === "prefix") {
+      patch.naming_prefix = value;
+      patch.naming_mode = value ? "prefix" : "keep";
+    }
+    if (key === "keywords") patch.blocked_keywords = value;
+  }
+  return patch;
+};
+
+const looksLikeBase64 = (value) => /^[A-Za-z0-9+/=\n\r]+$/.test(value.trim());
+
+const isValidSubscriptionText = (text) => {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (/error|not\s+found|invalid/i.test(trimmed)) return false;
+  return /:\/\//.test(trimmed);
+};
+
+const sanitizeLines = (lines, blockedKeywords = []) => {
+  const blockedSet = blockedKeywords.map((item) => item.toLowerCase());
+  return lines.filter((line) => {
+    const lower = line.toLowerCase();
+    if (!line) return false;
+    if (line.startsWith("#")) return false;
+    if (blockedSet.some((kw) => kw && lower.includes(kw))) return false;
+    return true;
+  });
+};
+
 // =============================
 // Data Access Layer (D1 queries)
 // =============================
 const D1 = {
-  async getUserByTelegramId(db, telegramUserId) {
-    return db.prepare("SELECT * FROM users WHERE telegram_user_id = ?").bind(telegramUserId).first();
+  async getOperatorByTelegramId(db, telegramUserId) {
+    return db.prepare("SELECT * FROM operators WHERE telegram_user_id = ?").bind(telegramUserId).first();
   },
-  async createUser(db, telegramUserId, username, displayName) {
+  async listOperators(db) {
+    return db.prepare("SELECT * FROM operators ORDER BY created_at DESC").all();
+  },
+  async createOperator(db, telegramUserId, displayName) {
     const id = crypto.randomUUID();
     await db
       .prepare(
-        "INSERT INTO users (id, telegram_user_id, telegram_username, display_name, status, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)"
+        "INSERT INTO operators (id, telegram_user_id, display_name, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)"
       )
-      .bind(id, telegramUserId, username || null, displayName || null, nowIso(), nowIso(), nowIso())
+      .bind(id, telegramUserId, displayName || null, nowIso(), nowIso())
       .run();
     await db
-      .prepare("INSERT INTO user_settings (user_id, created_at, updated_at) VALUES (?, ?, ?)")
+      .prepare("INSERT INTO operator_settings (operator_id, created_at, updated_at) VALUES (?, ?, ?)")
       .bind(id, nowIso(), nowIso())
       .run();
     await db
-      .prepare("INSERT INTO subscription_rules (user_id, created_at, updated_at) VALUES (?, ?, ?)")
+      .prepare("INSERT INTO subscription_rules (operator_id, created_at, updated_at) VALUES (?, ?, ?)")
       .bind(id, nowIso(), nowIso())
       .run();
     await db
-      .prepare("INSERT INTO share_links (id, user_id, public_token, is_active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)")
+      .prepare("INSERT INTO share_links (id, operator_id, public_token, is_active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)")
       .bind(crypto.randomUUID(), id, crypto.randomUUID(), nowIso(), nowIso())
       .run();
-    return this.getUserByTelegramId(db, telegramUserId);
+    return this.getOperatorByTelegramId(db, telegramUserId);
   },
-  async touchUser(db, userId) {
-    await db.prepare("UPDATE users SET last_seen_at = ?, updated_at = ? WHERE id = ?").bind(nowIso(), nowIso(), userId).run();
-  },
-  async updateUserStatus(db, telegramUserId, status) {
+  async removeOperator(db, telegramUserId) {
     await db
-      .prepare("UPDATE users SET status = ?, updated_at = ? WHERE telegram_user_id = ?")
-      .bind(status, nowIso(), telegramUserId)
+      .prepare("UPDATE operators SET status = 'removed', updated_at = ? WHERE telegram_user_id = ?")
+      .bind(nowIso(), telegramUserId)
       .run();
   },
-  async getSettings(db, userId) {
-    return db.prepare("SELECT * FROM user_settings WHERE user_id = ?").bind(userId).first();
+  async touchOperator(db, operatorId) {
+    await db.prepare("UPDATE operators SET updated_at = ? WHERE id = ?").bind(nowIso(), operatorId).run();
   },
-  async updateSettings(db, userId, patch) {
+  async getSettings(db, operatorId) {
+    return db.prepare("SELECT * FROM operator_settings WHERE operator_id = ?").bind(operatorId).first();
+  },
+  async updateSettings(db, operatorId, patch) {
     const fields = Object.keys(patch);
     if (!fields.length) return;
     const setClause = fields.map((field) => `${field} = ?`).join(", ");
     const values = fields.map((field) => patch[field]);
     await db
-      .prepare(`UPDATE user_settings SET ${setClause}, updated_at = ? WHERE user_id = ?`)
-      .bind(...values, nowIso(), userId)
+      .prepare(`UPDATE operator_settings SET ${setClause}, updated_at = ? WHERE operator_id = ?`)
+      .bind(...values, nowIso(), operatorId)
       .run();
   },
-  async getRules(db, userId) {
-    return db.prepare("SELECT * FROM subscription_rules WHERE user_id = ?").bind(userId).first();
-  },
-  async updateRules(db, userId, patch) {
-    const fields = Object.keys(patch);
-    if (!fields.length) return;
-    const setClause = fields.map((field) => `${field} = ?`).join(", ");
-    const values = fields.map((field) => patch[field]);
-    await db
-      .prepare(`UPDATE subscription_rules SET ${setClause}, updated_at = ? WHERE user_id = ?`)
-      .bind(...values, nowIso(), userId)
-      .run();
-  },
-  async listExtraConfigs(db, userId) {
+  async listDomains(db, operatorId) {
     return db
-      .prepare("SELECT * FROM extra_configs WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at")
-      .bind(userId)
+      .prepare("SELECT * FROM operator_domains WHERE operator_id = ? AND deleted_at IS NULL ORDER BY created_at DESC")
+      .bind(operatorId)
       .all();
   },
-  async createExtraConfig(db, userId, title, content) {
+  async createDomain(db, operatorId, domain) {
     await db
       .prepare(
-        "INSERT INTO extra_configs (id, user_id, title, content, is_enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, ?, ?)"
+        "INSERT INTO operator_domains (id, operator_id, domain, verified, verification_token, is_active, created_at, updated_at) VALUES (?, ?, ?, 0, ?, 1, ?, ?)"
       )
-      .bind(crypto.randomUUID(), userId, title || null, content, nowIso(), nowIso())
+      .bind(crypto.randomUUID(), operatorId, domain, crypto.randomUUID(), nowIso(), nowIso())
       .run();
   },
-  async updateExtraConfig(db, userId, configId, content) {
+  async setDomainActive(db, operatorId, domainId) {
     await db
-      .prepare("UPDATE extra_configs SET content = ?, updated_at = ? WHERE id = ? AND user_id = ?")
-      .bind(content, nowIso(), configId, userId)
+      .prepare("UPDATE operator_settings SET active_domain_id = ?, updated_at = ? WHERE operator_id = ?")
+      .bind(domainId, nowIso(), operatorId)
       .run();
-  },
-  async deleteExtraConfig(db, userId, configId) {
     await db
-      .prepare("UPDATE extra_configs SET deleted_at = ?, updated_at = ? WHERE id = ? AND user_id = ?")
-      .bind(nowIso(), nowIso(), configId, userId)
+      .prepare("UPDATE operator_domains SET is_active = 0 WHERE operator_id = ?")
+      .bind(operatorId)
       .run();
-  },
-  async listDomains(db, userId) {
-    return db
-      .prepare("SELECT * FROM user_domains WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at")
-      .bind(userId)
-      .all();
+    await db
+      .prepare("UPDATE operator_domains SET is_active = 1 WHERE id = ? AND operator_id = ?")
+      .bind(domainId, operatorId)
+      .run();
   },
   async getDomainById(db, domainId) {
-    return db.prepare("SELECT * FROM user_domains WHERE id = ? AND deleted_at IS NULL").bind(domainId).first();
+    return db.prepare("SELECT * FROM operator_domains WHERE id = ? AND deleted_at IS NULL").bind(domainId).first();
   },
-  async setDomainActive(db, userId, domainId) {
-    await db.prepare("UPDATE user_settings SET domain_active_id = ?, updated_at = ? WHERE user_id = ?").bind(domainId, nowIso(), userId).run();
+  async listExtraConfigs(db, operatorId) {
+    return db
+      .prepare("SELECT * FROM extra_configs WHERE operator_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at")
+      .bind(operatorId)
+      .all();
   },
-  async createDomain(db, userId, domain) {
+  async createExtraConfig(db, operatorId, title, content) {
     await db
       .prepare(
-        "INSERT INTO user_domains (id, user_id, domain, is_verified, verification_method, verification_token, created_at, updated_at) VALUES (?, ?, ?, 0, 'dns', ?, ?, ?)"
+        "INSERT INTO extra_configs (id, operator_id, title, content, is_enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, ?, ?)"
       )
-      .bind(crypto.randomUUID(), userId, domain, crypto.randomUUID(), nowIso(), nowIso())
+      .bind(crypto.randomUUID(), operatorId, title || null, content, nowIso(), nowIso())
+      .run();
+  },
+  async updateExtraConfig(db, operatorId, configId, content) {
+    await db
+      .prepare("UPDATE extra_configs SET content = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
+      .bind(content, nowIso(), configId, operatorId)
+      .run();
+  },
+  async setExtraEnabled(db, operatorId, configId, enabled) {
+    await db
+      .prepare("UPDATE extra_configs SET is_enabled = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
+      .bind(enabled ? 1 : 0, nowIso(), configId, operatorId)
+      .run();
+  },
+  async deleteExtraConfig(db, operatorId, configId) {
+    await db
+      .prepare("UPDATE extra_configs SET deleted_at = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
+      .bind(nowIso(), nowIso(), configId, operatorId)
+      .run();
+  },
+  async getRules(db, operatorId) {
+    return db.prepare("SELECT * FROM subscription_rules WHERE operator_id = ?").bind(operatorId).first();
+  },
+  async updateRules(db, operatorId, patch) {
+    const fields = Object.keys(patch);
+    if (!fields.length) return;
+    const setClause = fields.map((field) => `${field} = ?`).join(", ");
+    const values = fields.map((field) => patch[field]);
+    await db
+      .prepare(`UPDATE subscription_rules SET ${setClause}, updated_at = ? WHERE operator_id = ?`)
+      .bind(...values, nowIso(), operatorId)
       .run();
   },
   async getShareLinkByToken(db, token) {
@@ -254,34 +307,47 @@ const D1 = {
       .bind(token)
       .first();
   },
-  async getShareLinkByUser(db, userId) {
+  async getShareLinkByOperator(db, operatorId) {
     return db
-      .prepare("SELECT * FROM share_links WHERE user_id = ? AND is_active = 1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1")
-      .bind(userId)
+      .prepare("SELECT * FROM share_links WHERE operator_id = ? AND is_active = 1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1")
+      .bind(operatorId)
       .first();
   },
-  async rotateShareLink(db, userId) {
+  async rotateShareLink(db, operatorId) {
     const now = nowIso();
     await db
-      .prepare("UPDATE share_links SET is_active = 0, revoked_at = ?, updated_at = ? WHERE user_id = ? AND is_active = 1")
-      .bind(now, now, userId)
+      .prepare("UPDATE share_links SET is_active = 0, revoked_at = ?, updated_at = ? WHERE operator_id = ? AND is_active = 1")
+      .bind(now, now, operatorId)
       .run();
     await db
-      .prepare("INSERT INTO share_links (id, user_id, public_token, is_active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)")
-      .bind(crypto.randomUUID(), userId, crypto.randomUUID(), now, now)
+      .prepare("INSERT INTO share_links (id, operator_id, public_token, is_active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)")
+      .bind(crypto.randomUUID(), operatorId, crypto.randomUUID(), now, now)
       .run();
-    return this.getShareLinkByUser(db, userId);
+    return this.getShareLinkByOperator(db, operatorId);
+  },
+  async upsertLastKnownGood(db, operatorId, token, bodyB64, headersJson) {
+    await db
+      .prepare(
+        "INSERT INTO last_known_good (operator_id, public_token, body_b64, headers_json, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(operator_id, public_token) DO UPDATE SET body_b64 = excluded.body_b64, headers_json = excluded.headers_json, updated_at = excluded.updated_at"
+      )
+      .bind(operatorId, token, bodyB64, headersJson, nowIso())
+      .run();
+  },
+  async getLastKnownGood(db, operatorId, token) {
+    return db
+      .prepare("SELECT * FROM last_known_good WHERE operator_id = ? AND public_token = ?")
+      .bind(operatorId, token)
+      .first();
   },
   async logAudit(db, payload) {
     const id = crypto.randomUUID();
     await db
       .prepare(
-        "INSERT INTO audit_logs (id, user_id, public_token, event_type, ip, country, user_agent, request_path, response_status, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO audit_logs (id, operator_id, event_type, ip, country, user_agent, request_path, response_status, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       )
       .bind(
         id,
-        payload.user_id || null,
-        payload.public_token || null,
+        payload.operator_id || null,
         payload.event_type,
         payload.ip || null,
         payload.country || null,
@@ -293,96 +359,117 @@ const D1 = {
       )
       .run();
   },
-  async listAuditLogs(db, userId, limit = 5) {
+  async listAuditLogs(db, operatorId, limit = 5) {
     return db
-      .prepare("SELECT * FROM audit_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?")
-      .bind(userId, limit)
+      .prepare("SELECT * FROM audit_logs WHERE operator_id = ? ORDER BY created_at DESC LIMIT ?")
+      .bind(operatorId, limit)
       .all();
-  },
-  async setBotSetting(db, key, value) {
-    await db
-      .prepare("INSERT INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
-      .bind(key, value, nowIso())
-      .run();
-  },
-  async getBotSetting(db, key) {
-    return db.prepare("SELECT * FROM bot_settings WHERE key = ?").bind(key).first();
   },
 };
 
 // =============================
 // Domain Services
 // =============================
-const OnboardingService = {
-  async ensureUser(db, telegramUser) {
-    let user = await D1.getUserByTelegramId(db, telegramUser.id);
-    if (!user) {
-      user = await D1.createUser(db, telegramUser.id, telegramUser.username, telegramUser.first_name);
+const OperatorService = {
+  async ensureOperator(db, telegramUser, env) {
+    let operator = await D1.getOperatorByTelegramId(db, telegramUser.id);
+    if (!operator && isAdmin(telegramUser.id, env)) {
+      operator = await D1.createOperator(db, telegramUser.id, telegramUser.first_name || telegramUser.username);
     }
-    await D1.touchUser(db, user.id);
-    return user;
+    if (!operator || operator.status !== "active") return null;
+    await D1.touchOperator(db, operator.id);
+    return operator;
   },
-  async getProgress(db, userId) {
-    const settings = await D1.getSettings(db, userId);
-    const share = await D1.getShareLinkByUser(db, userId);
-    const extras = await D1.listExtraConfigs(db, userId);
-    const rules = await D1.getRules(db, userId);
-    const domainReady = Boolean(settings?.domain_active_id);
-    return {
-      settings,
-      share,
-      extrasCount: extras?.results?.length || 0,
-      rules,
-      steps: {
-        A: Boolean(settings?.mainstream_name && settings?.upstream_url),
-        B: true,
-        C: domainReady,
-        D: (extras?.results?.length || 0) > 0,
-        E: Boolean(rules),
-      },
-    };
+  async getShareLink(db, operator, baseUrl) {
+    const settings = await D1.getSettings(db, operator.id);
+    const share = await D1.getShareLinkByOperator(db, operator.id);
+    let hostBase = baseUrl;
+    if (settings?.active_domain_id) {
+      const domain = await D1.getDomainById(db, settings.active_domain_id);
+      if (domain?.domain) hostBase = `https://${domain.domain}`;
+    }
+    return `${hostBase.replace(/\/$/, "")}/sub/${share?.public_token || ""}`;
   },
 };
 
 const SubscriptionAssembler = {
-  async assemble(env, db, userId, token, request) {
-    const settings = await D1.getSettings(db, userId);
-    const rules = await D1.getRules(db, userId);
-    const extras = await D1.listExtraConfigs(db, userId);
+  async assemble(env, db, operatorId, token, request) {
+    const settings = await D1.getSettings(db, operatorId);
+    const rules = await D1.getRules(db, operatorId);
+    const extras = await D1.listExtraConfigs(db, operatorId);
 
-    const upstreamUrl = settings?.upstream_url;
-    const upstreamContent = await this.fetchUpstream(upstreamUrl, env, token);
+    const upstreamUrl = this.resolveUpstream(settings?.upstream_url, env);
+    const upstreamResponse = await this.fetchUpstream(upstreamUrl);
+    const upstreamText = this.decodeSubscription(upstreamResponse.body, upstreamResponse.isBase64);
+
+    if (!upstreamResponse.ok || !isValidSubscriptionText(upstreamText)) {
+      await D1.logAudit(db, {
+        operator_id: operatorId,
+        event_type: "upstream_invalid",
+        ip: request.headers.get("cf-connecting-ip"),
+        country: request.headers.get("cf-ipcountry"),
+        user_agent: request.headers.get("user-agent"),
+        request_path: new URL(request.url).pathname,
+        response_status: upstreamResponse.status,
+        meta_json: JSON.stringify({ reason: "upstream_invalid" }),
+      });
+      await AuditService.notifyOperator(env, settings, `⚠️ آپ‌استریم نامعتبر بود برای <b>${safeHtml(settings?.branding || "اپراتور")}</b>`);
+      return {
+        body: "",
+        headers: { ...DEFAULT_HEADERS, "x-sub-status": "upstream_invalid" },
+        valid: false,
+      };
+    }
+
     const extrasContent = (extras?.results || [])
       .filter((item) => item.is_enabled)
       .map((item) => item.content)
       .join("\n");
 
-    let merged = this.mergeContent(upstreamContent, extrasContent, rules);
-    merged = this.applyRules(merged, rules);
+    const merged = this.mergeContent(upstreamText, extrasContent, rules);
+    const processed = this.applyRules(merged, rules);
+    const encoded = utf8SafeEncode(processed);
 
-    await D1.logAudit(db, {
-      user_id: userId,
-      public_token: token,
-      event_type: "subscription_fetch",
-      ip: request.headers.get("cf-connecting-ip"),
-      country: request.headers.get("cf-ipcountry"),
-      user_agent: request.headers.get("user-agent"),
-      request_path: new URL(request.url).pathname,
-      response_status: 200,
-      meta_json: JSON.stringify({ extras: extras?.results?.length || 0, rules: rules?.merge_policy || null }),
-    });
-
-    return merged;
+    return {
+      body: encoded,
+      headers: {
+        ...DEFAULT_HEADERS,
+        ...(upstreamResponse.subscriptionUserinfo ? { "subscription-userinfo": upstreamResponse.subscriptionUserinfo } : {}),
+      },
+      valid: true,
+    };
   },
-  async fetchUpstream(upstreamUrl, env, token) {
-    if (!upstreamUrl) return "";
+  resolveUpstream(input, env) {
+    if (!input) return "";
+    if (/^https?:\/\//i.test(input)) return input;
+    if (env.UPSTREAM_BASE) return `${env.UPSTREAM_BASE.replace(/\/$/, "")}/${input}`;
+    if (env.UPSTREAM_HOST) return `https://${env.UPSTREAM_HOST.replace(/\/$/, "")}/${input}`;
+    return input;
+  },
+  async fetchUpstream(upstreamUrl) {
+    if (!upstreamUrl) return { ok: false, status: 400, body: "", subscriptionUserinfo: null, isBase64: false };
     try {
       const res = await fetch(upstreamUrl, { cf: { cacheTtl: 0 } });
-      if (!res.ok) return "";
-      return await res.text();
+      const text = await res.text();
+      return {
+        ok: res.ok,
+        status: res.status,
+        body: text,
+        subscriptionUserinfo: res.headers.get("subscription-userinfo"),
+        isBase64: looksLikeBase64(text),
+      };
     } catch (err) {
-      Logger.warn("Upstream fetch failed", { token, error: err?.message });
-      return "";
+      Logger.warn("Upstream fetch failed", { error: err?.message });
+      return { ok: false, status: 502, body: "", subscriptionUserinfo: null, isBase64: false };
+    }
+  },
+  decodeSubscription(body, isBase64) {
+    if (!body) return "";
+    if (!isBase64) return body;
+    try {
+      return utf8SafeDecode(body);
+    } catch {
+      return body;
     }
   },
   mergeContent(upstream, extras, rules) {
@@ -390,19 +477,20 @@ const SubscriptionAssembler = {
     if (policy === "upstream_only") return upstream || "";
     if (policy === "extras_only") return extras || "";
     if (policy === "replace") return extras || "";
-    const combined = [upstream, extras].filter(Boolean).join("\n");
-    return combined;
+    return [upstream, extras].filter(Boolean).join("\n");
   },
   applyRules(content, rules) {
     const lines = content
       .split("\n")
       .map((line) => line.trim())
       .filter(Boolean);
-    const dedupe = rules?.dedupe !== 0;
-    const sanitize = rules?.sanitize !== 0;
+    const blocked = (rules?.blocked_keywords || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
     let processed = lines;
-    if (sanitize) processed = processed.filter((line) => !line.startsWith("#"));
-    if (dedupe) processed = Array.from(new Set(processed));
+    if (rules?.sanitize !== 0) processed = sanitizeLines(processed, blocked);
+    if (rules?.dedupe !== 0) processed = Array.from(new Set(processed));
     if (rules?.naming_mode === "prefix" && rules?.naming_prefix) {
       processed = processed.map((line) => `${rules.naming_prefix}${line}`);
     }
@@ -411,14 +499,15 @@ const SubscriptionAssembler = {
 };
 
 const AuditService = {
-  async notifyTelegram(env, messageHtml) {
-    if (!env.LOG_CHANNEL_ID || !env.TELEGRAM_TOKEN) return;
+  async notifyOperator(env, settings, messageHtml) {
+    const channelId = settings?.channel_id || env.LOG_CHANNEL_ID;
+    if (!channelId || !env.TELEGRAM_TOKEN) return;
     try {
       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          chat_id: env.LOG_CHANNEL_ID,
+          chat_id: channelId,
           text: messageHtml,
           parse_mode: "HTML",
           disable_web_page_preview: true,
@@ -447,174 +536,46 @@ const Telegram = {
     const user = update.message?.from || update.callback_query?.from;
     if (!user) return new Response("ok");
     if (!rateLimit(`tg-user:${user.id}`)) return new Response("rate limit", { status: 429 });
-    if (!isAllowedUser(user.id, env)) {
-      await this.sendMessage(env, user.id, "⚠️ دسترسی شما در حال حاضر فعال نیست.");
-      return new Response("ok");
-    }
 
     const db = env.DB;
-    const userRecord = await OnboardingService.ensureUser(db, user);
-    if (userRecord.status === "banned") {
-      await this.sendMessage(env, user.id, "⛔️ دسترسی شما مسدود شده است.");
+    const operator = await OperatorService.ensureOperator(db, user, env);
+    if (!operator) {
+      await this.sendMessage(env, user.id, "⚠️ این ربات فقط برای اپراتورها فعال است.");
       return new Response("ok");
     }
 
     if (update.message) {
-      return this.handleMessage(env, db, userRecord, update.message);
+      return this.handleMessage(env, db, operator, update.message);
     }
     if (update.callback_query) {
-      return this.handleCallback(env, db, userRecord, update.callback_query);
+      return this.handleCallback(env, db, operator, update.callback_query);
     }
     return new Response("ok");
   },
-  async handleMessage(env, db, userRecord, message) {
+  async handleMessage(env, db, operator, message) {
     const text = parseMessageText(message);
-    if (text.startsWith("/start")) {
-      const progress = await OnboardingService.getProgress(db, userRecord.id);
-      const payload = this.buildOnboardingMessage(progress, userRecord, env);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
-      await AuditService.notifyTelegram(env, `🧊 کاربر جدید: <b>${safeHtml(userRecord.display_name || "بدون نام")}</b>`);
-      return new Response("ok");
-    }
-    if (text.startsWith("/panel")) {
-      const payload = await this.buildPanel(db, userRecord, env);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
-      return new Response("ok");
-    }
-    if (text.startsWith("/domain")) {
-      const payload = await this.buildDomainPanel(db, userRecord, env);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
-      return new Response("ok");
-    }
-    if (text.startsWith("/extras")) {
-      const payload = await this.buildExtrasPanel(db, userRecord);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
-      return new Response("ok");
-    }
-    if (text.startsWith("/rules")) {
-      const payload = await this.buildRulesPanel(db, userRecord);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
-      return new Response("ok");
-    }
-    if (text.startsWith("/logs")) {
-      const payload = await this.buildLogsPanel(db, userRecord);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
-      return new Response("ok");
-    }
-    if (text.startsWith("/ping")) {
-      await this.sendMessage(env, message.chat.id, "🟢 همه‌چیز سالم است.");
-      return new Response("ok");
-    }
+    const settings = await D1.getSettings(db, operator.id);
 
-    if (text.startsWith("/admin")) {
-      if (!isAdmin(userRecord.telegram_user_id, env)) {
-        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
-        return new Response("ok");
-      }
-      const payload = this.buildAdminPanel();
+    if (text.startsWith("/start") || text.startsWith("/panel")) {
+      const payload = await this.buildPanel(db, operator, env);
       await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
       return new Response("ok");
     }
-    if (text.startsWith("/botsettings")) {
-      if (!isAdmin(userRecord.telegram_user_id, env)) {
-        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
+    if (text.startsWith("/set_upstream")) {
+      const value = text.replace("/set_upstream", "").trim();
+      if (!value) {
+        await this.sendMessage(env, message.chat.id, "❗️فرمت: /set_upstream لینک_پنل یا توکن");
         return new Response("ok");
       }
-      const parts = text.split(" ").slice(1);
-      const [key, ...valueParts] = parts;
-      const value = valueParts.join(" ").trim();
-      if (!key || !value) {
-        await this.sendMessage(env, message.chat.id, "❗️فرمت: /botsettings کلید مقدار");
-        return new Response("ok");
-      }
-      await D1.setBotSetting(db, key, value);
-      await this.sendMessage(env, message.chat.id, "✅ تنظیمات ربات ذخیره شد.");
+      await D1.updateSettings(db, operator.id, { upstream_url: value });
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update", meta_json: JSON.stringify({ field: "upstream_url" }) });
+      const updatedSettings = await D1.getSettings(db, operator.id);
+      await AuditService.notifyOperator(env, updatedSettings, `🧊 آپ‌استریم بروزرسانی شد برای <b>${safeHtml(operator.display_name || "اپراتور")}</b>`);
+      await this.sendMessage(env, message.chat.id, "✅ لینک آپ‌استریم ذخیره شد.");
       return new Response("ok");
     }
-    if (text.startsWith("/broadcast")) {
-      if (!isAdmin(userRecord.telegram_user_id, env)) {
-        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
-        return new Response("ok");
-      }
-      const messageBody = text.replace("/broadcast", "").trim();
-      if (!messageBody) {
-        await this.sendMessage(env, message.chat.id, "❗️متن پیام را بنویسید.");
-        return new Response("ok");
-      }
-      await AuditService.notifyTelegram(env, `📣 اطلاعیه مدیر:\n${safeHtml(messageBody)}`);
-      await this.sendMessage(env, message.chat.id, "✅ ارسال شد.");
-      return new Response("ok");
-    }
-    if (text.startsWith("/ban")) {
-      if (!isAdmin(userRecord.telegram_user_id, env)) {
-        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
-        return new Response("ok");
-      }
-      const targetId = text.replace("/ban", "").trim();
-      if (!targetId) {
-        await this.sendMessage(env, message.chat.id, "❗️شناسه کاربر را بنویسید.");
-        return new Response("ok");
-      }
-      await D1.updateUserStatus(db, targetId, "banned");
-      await this.sendMessage(env, message.chat.id, "✅ کاربر مسدود شد.");
-      return new Response("ok");
-    }
-    if (text.startsWith("/approve")) {
-      if (!isAdmin(userRecord.telegram_user_id, env)) {
-        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
-        return new Response("ok");
-      }
-      const targetId = text.replace("/approve", "").trim();
-      if (!targetId) {
-        await this.sendMessage(env, message.chat.id, "❗️شناسه کاربر را بنویسید.");
-        return new Response("ok");
-      }
-      await D1.updateUserStatus(db, targetId, "active");
-      await this.sendMessage(env, message.chat.id, "✅ کاربر تایید شد.");
-      return new Response("ok");
-    }
-
-    if (text.startsWith("/setmain")) {
-      const parts = text.split(" ").slice(1);
-      const [name, ...urlParts] = parts;
-      const url = urlParts.join(" ");
-      if (!name || !url) {
-        await this.sendMessage(env, message.chat.id, "❗️فرمت: /setmain نام لینک_اصلی");
-        return new Response("ok");
-      }
-      await D1.updateSettings(db, userRecord.id, { mainstream_name: name, upstream_url: url });
-      await AuditService.notifyTelegram(env, `🧊 تنظیمات آپدیت شد: <b>${safeHtml(name)}</b>`);
-      await this.sendMessage(env, message.chat.id, "✅ اطلاعات مین‌استریم ذخیره شد.");
-      return new Response("ok");
-    }
-
-    if (text.startsWith("/addextra")) {
-      const content = text.replace("/addextra", "").trim();
-      if (!content) {
-        await this.sendMessage(env, message.chat.id, "❗️بعد از دستور متن کانفیگ را بفرستید.");
-        return new Response("ok");
-      }
-      await D1.createExtraConfig(db, userRecord.id, "افزودنی", content);
-      await AuditService.notifyTelegram(env, `🧊 افزودنی جدید ثبت شد برای <b>${safeHtml(userRecord.display_name || "کاربر")}</b>`);
-      await this.sendMessage(env, message.chat.id, "✅ کانفیگ اضافی ثبت شد.");
-      return new Response("ok");
-    }
-    if (text.startsWith("/editextra")) {
-      const parts = text.split(" ").slice(1);
-      const [configId, ...contentParts] = parts;
-      const content = contentParts.join(" ").trim();
-      if (!configId || !content) {
-        await this.sendMessage(env, message.chat.id, "❗️فرمت: /editextra شناسه متن_جدید");
-        return new Response("ok");
-      }
-      await D1.updateExtraConfig(db, userRecord.id, configId, content);
-      await AuditService.notifyTelegram(env, `🧊 افزودنی ویرایش شد برای <b>${safeHtml(userRecord.display_name || "کاربر")}</b>`);
-      await this.sendMessage(env, message.chat.id, "✅ کانفیگ بروزرسانی شد.");
-      return new Response("ok");
-    }
-
-    if (text.startsWith("/setdomain")) {
-      const domain = text.replace("/setdomain", "").trim();
+    if (text.startsWith("/set_domain")) {
+      const domain = text.replace("/set_domain", "").trim();
       if (!domain) {
         await this.sendMessage(env, message.chat.id, "❗️دامنه را وارد کنید.");
         return new Response("ok");
@@ -623,195 +584,296 @@ const Telegram = {
         await this.sendMessage(env, message.chat.id, "❗️دامنه معتبر نیست.");
         return new Response("ok");
       }
-      await D1.createDomain(db, userRecord.id, domain);
-      const domains = await D1.listDomains(db, userRecord.id);
-      const latest = domains?.results?.slice(-1)[0];
-      if (latest) await D1.setDomainActive(db, userRecord.id, latest.id);
-      await AuditService.notifyTelegram(env, `🧊 دامنه ثبت شد: <b>${safeHtml(domain)}</b>`);
-      await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد: ${safeHtml(domain)}`);
+      await D1.createDomain(db, operator.id, domain);
+      const domains = await D1.listDomains(db, operator.id);
+      const latest = domains?.results?.[0];
+      if (latest) await D1.setDomainActive(db, operator.id, latest.id);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "domain_update", meta_json: JSON.stringify({ domain }) });
+      const updatedSettings = await D1.getSettings(db, operator.id);
+      await AuditService.notifyOperator(env, updatedSettings, `🧊 دامنه ثبت شد: <b>${safeHtml(domain)}</b>`);
+      const token = latest?.verification_token ? `\nتوکن تایید: <code>${safeHtml(latest.verification_token)}</code>` : "";
+      const guide = "\nراهنما: یک رکورد TXT روی دامنه با مقدار بالا ثبت کنید.";
+      await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد و به عنوان فعال تنظیم گردید.${token}${guide}`);
+      return new Response("ok");
+    }
+    if (text.startsWith("/set_channel")) {
+      const channelId = text.replace("/set_channel", "").trim();
+      if (!channelId) {
+        await this.sendMessage(env, message.chat.id, "❗️فرمت: /set_channel -1001234567890");
+        return new Response("ok");
+      }
+      await D1.updateSettings(db, operator.id, { channel_id: channelId });
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update", meta_json: JSON.stringify({ field: "channel_id" }) });
+      await AuditService.notifyOperator(env, { channel_id: channelId }, `🧊 کانال اطلاع‌رسانی تنظیم شد.`);
+      await this.sendMessage(env, message.chat.id, "✅ کانال اطلاع‌رسانی ذخیره شد.");
+      return new Response("ok");
+    }
+    if (text.startsWith("/extras")) {
+      const payload = await this.buildExtrasPanel(db, operator);
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
+      return new Response("ok");
+    }
+    if (text.startsWith("/add_extra")) {
+      const content = text.replace("/add_extra", "").trim();
+      if (!content) {
+        await this.sendMessage(env, message.chat.id, "❗️بعد از دستور متن کانفیگ را بفرستید.");
+        return new Response("ok");
+      }
+      await D1.createExtraConfig(db, operator.id, "افزودنی", content);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update", meta_json: JSON.stringify({ action: "add" }) });
+      await AuditService.notifyOperator(env, settings, `🧊 افزودنی جدید ثبت شد برای <b>${safeHtml(operator.display_name || "اپراتور")}</b>`);
+      await this.sendMessage(env, message.chat.id, "✅ کانفیگ اضافی ثبت شد.");
+      return new Response("ok");
+    }
+    if (text.startsWith("/edit_extra")) {
+      const parts = text.split(" ").slice(1);
+      const [configId, ...contentParts] = parts;
+      const content = contentParts.join(" ").trim();
+      if (!configId || !content) {
+        await this.sendMessage(env, message.chat.id, "❗️فرمت: /edit_extra شناسه متن_جدید");
+        return new Response("ok");
+      }
+      await D1.updateExtraConfig(db, operator.id, configId, content);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update", meta_json: JSON.stringify({ action: "edit" }) });
+      await this.sendMessage(env, message.chat.id, "✅ کانفیگ ویرایش شد.");
+      return new Response("ok");
+    }
+    if (text.startsWith("/rules")) {
+      const payload = await this.buildRulesPanel(db, operator);
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
+      return new Response("ok");
+    }
+    if (text.startsWith("/set_rules")) {
+      const patch = parseRulesArgs(text);
+      if (!Object.keys(patch).length) {
+        await this.sendMessage(env, message.chat.id, "❗️فرمت: /set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam");
+        return new Response("ok");
+      }
+      await D1.updateRules(db, operator.id, patch);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "rules_update", meta_json: JSON.stringify(patch) });
+      await AuditService.notifyOperator(env, settings, "🧊 قوانین اشتراک بروزرسانی شد.");
+      await this.sendMessage(env, message.chat.id, "✅ قوانین ذخیره شد.");
+      return new Response("ok");
+    }
+    if (text.startsWith("/link")) {
+      const payload = await this.buildLinkPanel(db, operator, env);
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
+      return new Response("ok");
+    }
+    if (text.startsWith("/rotate")) {
+      const share = await D1.rotateShareLink(db, operator.id);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "link_rotate" });
+      const link = await OperatorService.getShareLink(db, operator, env.BASE_URL || "");
+      await this.sendMessage(env, message.chat.id, `✅ لینک جدید: <code>${safeHtml(link)}</code>`);
+      return new Response("ok");
+    }
+    if (text.startsWith("/logs")) {
+      const payload = await this.buildLogsPanel(db, operator);
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
+      return new Response("ok");
+    }
+
+    if (text.startsWith("/admin_list_operators")) {
+      if (!isAdmin(operator.telegram_user_id, env)) {
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
+        return new Response("ok");
+      }
+      const operators = await D1.listOperators(db);
+      const list = (operators?.results || [])
+        .map((item) => `• ${safeHtml(item.display_name || item.telegram_user_id)} (${safeHtml(item.telegram_user_id)}) - ${safeHtml(item.status)}`) 
+        .join("\n");
+      await this.sendMessage(env, message.chat.id, list || "لیست خالی است.");
+      return new Response("ok");
+    }
+    if (text.startsWith("/admin_add_operator")) {
+      if (!isAdmin(operator.telegram_user_id, env)) {
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
+        return new Response("ok");
+      }
+      const targetId = text.replace("/admin_add_operator", "").trim();
+      if (!targetId) {
+        await this.sendMessage(env, message.chat.id, "❗️شناسه تلگرام را وارد کنید.");
+        return new Response("ok");
+      }
+      const existing = await D1.getOperatorByTelegramId(db, targetId);
+      if (!existing) {
+        await D1.createOperator(db, targetId, "Operator");
+      }
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_add_operator", meta_json: JSON.stringify({ targetId }) });
+      await this.sendMessage(env, message.chat.id, "✅ اپراتور اضافه شد.");
+      return new Response("ok");
+    }
+    if (text.startsWith("/admin_remove_operator")) {
+      if (!isAdmin(operator.telegram_user_id, env)) {
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
+        return new Response("ok");
+      }
+      const targetId = text.replace("/admin_remove_operator", "").trim();
+      if (!targetId) {
+        await this.sendMessage(env, message.chat.id, "❗️شناسه تلگرام را وارد کنید.");
+        return new Response("ok");
+      }
+      await D1.removeOperator(db, targetId);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_remove_operator", meta_json: JSON.stringify({ targetId }) });
+      await this.sendMessage(env, message.chat.id, "✅ اپراتور غیرفعال شد.");
+      return new Response("ok");
+    }
+    if (text.startsWith("/admin_broadcast")) {
+      if (!isAdmin(operator.telegram_user_id, env)) {
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
+        return new Response("ok");
+      }
+      const messageBody = text.replace("/admin_broadcast", "").trim();
+      if (!messageBody) {
+        await this.sendMessage(env, message.chat.id, "❗️متن پیام را بنویسید.");
+        return new Response("ok");
+      }
+      const operators = await D1.listOperators(db);
+      for (const item of operators?.results || []) {
+        const opSettings = await D1.getSettings(db, item.id);
+        await AuditService.notifyOperator(env, opSettings, `📣 پیام مدیر: ${safeHtml(messageBody)}`);
+      }
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_broadcast" });
+      await this.sendMessage(env, message.chat.id, "✅ پیام ارسال شد.");
+      return new Response("ok");
+    }
+    if (text.startsWith("/admin_health")) {
+      await this.sendMessage(env, message.chat.id, `🟢 سلامت سیستم: ${APP.name} v${APP.version}`);
       return new Response("ok");
     }
 
     await this.sendMessage(env, message.chat.id, "❓ دستور ناشناخته. /panel را بزنید.");
     return new Response("ok");
   },
-  async handleCallback(env, db, userRecord, callback) {
+  async handleCallback(env, db, operator, callback) {
     const data = decodeCallbackData(callback.data || "");
     const action = data.action || "";
     const chatId = callback.message?.chat?.id;
     if (!chatId) return new Response("ok");
 
-    if (action === "rotate_token") {
-      const share = await D1.rotateShareLink(db, userRecord.id);
-      const baseUrl = env.BASE_URL || "";
-      const link = await this.buildShareLink(db, baseUrl, userRecord, share);
-      await this.sendMessage(env, chatId, `✅ لینک جدید: <code>${safeHtml(link)}</code>`);
+    if (action === "toggle_extra" && data.id) {
+      await D1.setExtraEnabled(db, operator.id, data.id, data.enabled);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update", meta_json: JSON.stringify({ action: "toggle" }) });
+      await this.sendMessage(env, chatId, "✅ وضعیت افزودنی تغییر کرد.");
       return new Response("ok");
     }
-
-    if (action === "set_rules") {
-      await D1.updateRules(db, userRecord.id, { merge_policy: data.policy || "append", dedupe: data.dedupe ? 1 : 0 });
-      await this.sendMessage(env, chatId, "✅ قوانین اشتراک ذخیره شد.");
-      return new Response("ok");
-    }
-
     if (action === "delete_extra" && data.id) {
-      await D1.deleteExtraConfig(db, userRecord.id, data.id);
-      await AuditService.notifyTelegram(env, `🧊 افزودنی حذف شد برای <b>${safeHtml(userRecord.display_name || "کاربر")}</b>`);
+      await D1.deleteExtraConfig(db, operator.id, data.id);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update", meta_json: JSON.stringify({ action: "delete" }) });
       await this.sendMessage(env, chatId, "🗑️ کانفیگ حذف شد.");
       return new Response("ok");
     }
-
-    if (action === "panel_refresh") {
-      const payload = await this.buildPanel(db, userRecord, env);
-      await this.sendMessage(env, chatId, payload.text, payload.keyboard);
+    if (action === "set_rules") {
+      await D1.updateRules(db, operator.id, data.patch || {});
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "rules_update" });
+      await this.sendMessage(env, chatId, "✅ قوانین اشتراک ذخیره شد.");
       return new Response("ok");
     }
     if (action === "panel_extras") {
-      const payload = await this.buildExtrasPanel(db, userRecord);
+      const payload = await this.buildExtrasPanel(db, operator);
       await this.sendMessage(env, chatId, payload.text, payload.keyboard);
       return new Response("ok");
     }
     if (action === "panel_rules") {
-      const payload = await this.buildRulesPanel(db, userRecord);
+      const payload = await this.buildRulesPanel(db, operator);
       await this.sendMessage(env, chatId, payload.text, payload.keyboard);
       return new Response("ok");
     }
-    if (action === "step_a") {
-      await this.sendMessage(env, chatId, "گام A: با دستور زیر نام پروفایل و لینک آپ‌استریم را ثبت کنید:\n<code>/setmain نام لینک_اصلی</code>");
+    if (action === "panel_channel") {
+      await this.sendMessage(env, chatId, "برای تنظیم کانال اطلاع‌رسانی:\n<code>/set_channel -100xxxxxxxxxx</code>");
       return new Response("ok");
     }
-    if (action === "step_c") {
-      await this.sendMessage(env, chatId, "گام C: دامنه اختصاصی خود را ثبت کنید:\n<code>/setdomain example.com</code>");
-      return new Response("ok");
-    }
-    if (action === "step_d") {
-      await this.sendMessage(env, chatId, "گام D: کانفیگ‌های اضافی را اضافه کنید:\n<code>/addextra متن_کانفیگ</code>");
-      return new Response("ok");
-    }
-    if (action === "step_e") {
-      await this.sendMessage(env, chatId, "گام E: قوانین ادغام را از پنل قوانین تنظیم کنید. /rules");
+    if (action === "show_link") {
+      const payload = await this.buildLinkPanel(db, operator, env);
+      await this.sendMessage(env, chatId, payload.text, payload.keyboard);
       return new Response("ok");
     }
 
     await this.sendMessage(env, chatId, "✅ انجام شد.");
     return new Response("ok");
   },
-  async buildShareLink(db, baseUrl, userRecord, share) {
-    const token = share?.public_token || "";
-    let hostBase = baseUrl || "";
-    const settings = await D1.getSettings(db, userRecord.id);
-    if (settings?.domain_active_id) {
-      const domain = await D1.getDomainById(db, settings.domain_active_id);
-      if (domain?.domain) hostBase = `https://${domain.domain}`;
-    }
-    return `${hostBase.replace(/\/$/, "")}/sub/${token}`;
-  },
-
-  buildOnboardingMessage(progress, userRecord, env) {
-    const steps = progress.steps;
-    const statusIcon = (ok) => (ok ? "✅" : "⚪️");
+  async buildPanel(db, operator, env) {
+    const settings = await D1.getSettings(db, operator.id);
+    const domains = await D1.listDomains(db, operator.id);
+    const activeDomain = (domains?.results || []).find((item) => item.is_active);
+    const shareLink = await OperatorService.getShareLink(db, operator, env.BASE_URL || "");
     const text = `
-${GLASS} <b>خوش آمدید ${safeHtml(userRecord.display_name || "دوست عزیز")}</b>
+${GLASS} <b>پنل اپراتور</b>
 
-هدف: راه‌اندازی سریع اشتراک شخصی شما در ۵ قدم
+👤 اپراتور: <code>${safeHtml(operator.display_name || operator.telegram_user_id)}</code>
+🌐 دامنه فعال: <code>${safeHtml(activeDomain?.domain || "ثبت نشده")}</code>
+🔗 لینک اشتراک: <code>${safeHtml(shareLink)}</code>
 
-${statusIcon(steps.A)} گام A: ثبت پروفایل اصلی (نام + لینک)
-${statusIcon(steps.B)} گام B: تنظیمات ربات (اختیاری)
-${statusIcon(steps.C)} گام C: دامنه و لینک اشتراک
-${statusIcon(steps.D)} گام D: افزودنی‌ها (Extra Configs)
-${statusIcon(steps.E)} گام E: قوانین ادغام و نام‌گذاری
-
-🔹 شروع سریع: دستور زیر را بفرستید
-<code>/setmain نام لینک_اصلی</code>
-
-برای پنل کامل: /panel
+دستورات اصلی:
+/set_upstream لینک_پنل
+/set_domain example.com
+/set_channel -100xxxxxxxxxx
+/extras
+/rules
+/link
+/rotate
+/logs
     `.trim();
 
     const keyboard = {
       inline_keyboard: [
-        [{ text: GLASS_BTN("پنل مدیریت"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_refresh" })) }],
         [
-          { text: GLASS_BTN("گام A"), callback_data: utf8SafeEncode(JSON.stringify({ action: "step_a" })) },
-          { text: GLASS_BTN("گام C"), callback_data: utf8SafeEncode(JSON.stringify({ action: "step_c" })) },
+          { text: GLASS_BTN("مشاهده لینک"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_link" })) },
+          { text: GLASS_BTN("افزودنی‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_extras" })) },
         ],
         [
-          { text: GLASS_BTN("گام D"), callback_data: utf8SafeEncode(JSON.stringify({ action: "step_d" })) },
-          { text: GLASS_BTN("گام E"), callback_data: utf8SafeEncode(JSON.stringify({ action: "step_e" })) },
+          { text: GLASS_BTN("قوانین"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_rules" })) },
+          { text: GLASS_BTN("کانال"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_channel" })) },
         ],
       ],
     };
     return { text, keyboard };
   },
-  async buildPanel(db, userRecord, env) {
-    const progress = await OnboardingService.getProgress(db, userRecord.id);
+  async buildLinkPanel(db, operator, env) {
     let baseUrl = env.BASE_URL || "";
-    const shareLink = await this.buildShareLink(db, baseUrl, userRecord, progress.share);
-    if (!baseUrl && shareLink.startsWith("http")) {
-      baseUrl = new URL(shareLink).origin;
+    const link = await OperatorService.getShareLink(db, operator, baseUrl);
+    if (!baseUrl && link.startsWith("http")) {
+      baseUrl = new URL(link).origin;
     }
     const text = `
-${GLASS} <b>پنل اشتراک شخصی</b>
+${GLASS} <b>لینک اشتراک برند شما</b>
 
-👤 کاربر: <code>${safeHtml(userRecord.telegram_username || userRecord.display_name || "بدون نام")}</code>
-📌 لینک اشتراک: <code>${safeHtml(shareLink)}</code>
+<code>${safeHtml(link)}</code>
 
-وضعیت:
-• پروفایل اصلی: ${progress.steps.A ? "✅" : "⚪️"}
-• دامنه فعال: ${progress.steps.C ? "✅" : "⚪️"}
-• افزودنی‌ها: ${progress.extrasCount}
-
-دستورات سریع:
-/setmain نام لینک_اصلی
-/addextra متن_کانفیگ
-/setdomain دامنه
-
+با دکمه‌های زیر، لینک را مستقیم داخل اپلیکیشن‌های محبوب باز کنید.
     `.trim();
-
     const keyboard = {
       inline_keyboard: [
         [
-          { text: GLASS_BTN("کپی لینک"), url: `https://t.me/share/url?url=${encodeURIComponent(shareLink)}` },
-          { text: GLASS_BTN("پیش‌نمایش لینک"), url: shareLink },
-          { text: GLASS_BTN("چرخش توکن"), callback_data: utf8SafeEncode(JSON.stringify({ action: "rotate_token" })) },
+          { text: GLASS_BTN("کپی لینک"), url: `https://t.me/share/url?url=${encodeURIComponent(link)}` },
+          { text: GLASS_BTN("پیش‌نمایش"), url: link },
         ],
         [
           {
             text: GLASS_BTN("v2rayNG"),
-            url: `${baseUrl}/redirect?target=${encodeURIComponent(`v2rayng://install-config?url=${shareLink}#${userRecord.telegram_username || "Sub"}`)}`,
+            url: `${baseUrl}/redirect?target=${encodeURIComponent(`v2rayng://install-config?url=${link}#${operator.display_name || "Sub"}`)}`,
           },
           {
             text: GLASS_BTN("NekoBox"),
-            url: `${baseUrl}/redirect?target=${encodeURIComponent(`sn://subscription?url=${shareLink}&name=${userRecord.telegram_username || "Sub"}`)}`,
+            url: `${baseUrl}/redirect?target=${encodeURIComponent(`sn://subscription?url=${link}&name=${operator.display_name || "Sub"}`)}`,
           },
         ],
         [
-          { text: GLASS_BTN("افزودنی‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_extras" })) },
-          { text: GLASS_BTN("قوانین"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_rules" })) },
+          {
+            text: GLASS_BTN("Streisand"),
+            url: `${baseUrl}/redirect?target=${encodeURIComponent(`streisand://import/${link}`)}`,
+          },
+          {
+            text: GLASS_BTN("v2Box"),
+            url: `${baseUrl}/redirect?target=${encodeURIComponent(`v2box://install-sub?url=${link}&name=${operator.display_name || "Sub"}`)}`,
+          },
         ],
       ],
     };
     return { text, keyboard };
   },
-  async buildDomainPanel(db, userRecord) {
-    const domains = await D1.listDomains(db, userRecord.id);
-    const latest = domains?.results?.slice(-1)[0];
-    const text = `
-${GLASS} <b>مدیریت دامنه</b>
-
-دامنه فعلی: ${latest ? safeHtml(latest.domain) : "ثبت نشده"}
-
-برای ثبت دامنه جدید:
-<code>/setdomain example.com</code>
-
-راهنمای DNS:
-TXT record روی دامنه با مقدار توکن اختصاصی ثبت می‌شود (نمایش فقط).
-    `.trim();
-    const keyboard = { inline_keyboard: [[{ text: GLASS_BTN("بازگشت"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_refresh" })) }]] };
-    return { text, keyboard };
-  },
-  async buildExtrasPanel(db, userRecord) {
-    const extras = await D1.listExtraConfigs(db, userRecord.id);
+  async buildExtrasPanel(db, operator) {
+    const extras = await D1.listExtraConfigs(db, operator.id);
     const list = (extras?.results || [])
       .map((item) => `• ${safeHtml(item.title || "افزودنی")} (${safeHtml(item.id)}) ${item.is_enabled ? "✅" : "⛔️"}`)
       .join("\n");
@@ -821,44 +883,68 @@ ${GLASS} <b>افزودنی‌ها</b>
 ${list || "فعلاً موردی ثبت نشده."}
 
 برای افزودن:
-<code>/addextra متن_کانفیگ</code>
+<code>/add_extra متن_کانفیگ</code>
 برای ویرایش:
-<code>/editextra شناسه متن_جدید</code>
+<code>/edit_extra شناسه متن_جدید</code>
     `.trim();
     const keyboard = {
-      inline_keyboard: (extras?.results || []).map((item) => [
-        { text: GLASS_BTN(`حذف ${item.title || item.id}`), callback_data: utf8SafeEncode(JSON.stringify({ action: "delete_extra", id: item.id })) },
+      inline_keyboard: (extras?.results || []).flatMap((item) => [
+        [
+          {
+            text: GLASS_BTN(item.is_enabled ? "غیرفعال" : "فعال"),
+            callback_data: utf8SafeEncode(JSON.stringify({ action: "toggle_extra", id: item.id, enabled: !item.is_enabled })),
+          },
+          {
+            text: GLASS_BTN("حذف"),
+            callback_data: utf8SafeEncode(JSON.stringify({ action: "delete_extra", id: item.id })),
+          },
+        ],
       ]),
     };
     return { text, keyboard };
   },
-  async buildRulesPanel(db, userRecord) {
-    const rules = await D1.getRules(db, userRecord.id);
+  async buildRulesPanel(db, operator) {
+    const rules = await D1.getRules(db, operator.id);
     const text = `
 ${GLASS} <b>قوانین اشتراک</b>
 
 سیاست ادغام: ${safeHtml(rules?.merge_policy || "append")}
 حذف تکراری: ${rules?.dedupe ? "فعال" : "غیرفعال"}
 پاکسازی: ${rules?.sanitize ? "فعال" : "غیرفعال"}
+پیشوند نام: ${safeHtml(rules?.naming_prefix || "-")}
+کلیدواژه‌های مسدود: ${safeHtml(rules?.blocked_keywords || "-")}
 
-برای تغییر سریع از دکمه‌ها استفاده کنید.
+برای تغییر سریع از دکمه‌ها یا دستور زیر استفاده کنید:
+<code>/set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam</code>
     `.trim();
     const keyboard = {
       inline_keyboard: [
         [
           {
             text: GLASS_BTN("ادغام + حذف تکراری"),
-            callback_data: utf8SafeEncode(JSON.stringify({ action: "set_rules", policy: "append_dedupe", dedupe: true })),
+            callback_data: utf8SafeEncode(JSON.stringify({ action: "set_rules", patch: { merge_policy: "append_dedupe", dedupe: 1 } })),
           },
-          { text: GLASS_BTN("فقط اپ‌استریم"), callback_data: utf8SafeEncode(JSON.stringify({ action: "set_rules", policy: "upstream_only" })) },
+          {
+            text: GLASS_BTN("فقط اپ‌استریم"),
+            callback_data: utf8SafeEncode(JSON.stringify({ action: "set_rules", patch: { merge_policy: "upstream_only" } })),
+          },
         ],
-        [{ text: GLASS_BTN("بازگشت"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_refresh" })) }],
+        [
+          {
+            text: GLASS_BTN("فقط افزودنی‌ها"),
+            callback_data: utf8SafeEncode(JSON.stringify({ action: "set_rules", patch: { merge_policy: "extras_only" } })),
+          },
+          {
+            text: GLASS_BTN("پاکسازی خاموش"),
+            callback_data: utf8SafeEncode(JSON.stringify({ action: "set_rules", patch: { sanitize: 0 } })),
+          },
+        ],
       ],
     };
     return { text, keyboard };
   },
-  async buildLogsPanel(db, userRecord) {
-    const logs = await D1.listAuditLogs(db, userRecord.id, 5);
+  async buildLogsPanel(db, operator) {
+    const logs = await D1.listAuditLogs(db, operator.id, 5);
     const items = (logs?.results || [])
       .map((log) => `• ${safeHtml(log.event_type)} ${safeHtml(log.created_at)}`)
       .join("\n");
@@ -866,19 +952,6 @@ ${GLASS} <b>قوانین اشتراک</b>
 ${GLASS} <b>لاگ‌های اخیر</b>
 
 ${items || "فعلاً لاگی ثبت نشده."}
-    `.trim();
-    const keyboard = { inline_keyboard: [[{ text: GLASS_BTN("بازگشت"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_refresh" })) }]] };
-    return { text, keyboard };
-  },
-  buildAdminPanel() {
-    const text = `
-${GLASS} <b>پنل مدیر</b>
-
-گزینه‌ها:
-• تایید/مسدودسازی کاربران: /approve یا /ban
-• ارسال پیام سراسری: /broadcast پیام
-• تنظیمات ربات: /botsettings کلید مقدار
-• وضعیت سلامت سیستم: /health
     `.trim();
     return { text, keyboard: null };
   },
@@ -925,9 +998,7 @@ const Router = {
   async handleSubscription(request, env, token) {
     const cacheKey = `sub:${token}`;
     const cached = getCachedSub(cacheKey);
-    if (cached) {
-      return new Response(cached.body, { headers: cached.headers });
-    }
+    if (cached) return new Response(cached.body, { headers: cached.headers });
 
     const db = env.DB;
     const link = await D1.getShareLinkByToken(db, token);
@@ -938,28 +1009,49 @@ const Router = {
     const cachedResponse = await cache.match(cacheUrl);
     if (cachedResponse) {
       const body = await cachedResponse.text();
-      setCachedSub(cacheKey, body, DEFAULT_HEADERS);
-      return new Response(body, { headers: DEFAULT_HEADERS });
+      const headers = Object.fromEntries(cachedResponse.headers.entries());
+      setCachedSub(cacheKey, body, headers);
+      return new Response(body, { headers });
     }
 
-    const content = await SubscriptionAssembler.assemble(env, db, link.user_id, token, request);
-    const headers = {
-      ...DEFAULT_HEADERS,
-      "content-disposition": `inline; filename=subscription_${token}.txt`,
-    };
-    if (content) {
-      setCachedSub(cacheKey, content, headers);
-      setLastGood(cacheKey, content, headers);
-      await cache.put(cacheUrl, new Response(content, { headers, status: 200 }));
-      await AuditService.notifyTelegram(env, `🧊 اشتراک دریافت شد: <b>${safeHtml(token)}</b>`);
-      return new Response(content, { headers });
+    const { body, headers, valid } = await SubscriptionAssembler.assemble(env, db, link.operator_id, token, request);
+    const responseHeaders = { ...headers, "content-disposition": `inline; filename=sub_${token}.txt` };
+    if (valid) {
+      setCachedSub(cacheKey, body, responseHeaders);
+      setLastGoodMem(cacheKey, body, responseHeaders);
+      await cache.put(cacheUrl, new Response(body, { headers: responseHeaders, status: 200 }));
+      await D1.upsertLastKnownGood(db, link.operator_id, token, utf8SafeEncode(body), JSON.stringify(responseHeaders));
+      await D1.logAudit(db, {
+        operator_id: link.operator_id,
+        event_type: "subscription_fetch",
+        ip: request.headers.get("cf-connecting-ip"),
+        country: request.headers.get("cf-ipcountry"),
+        user_agent: request.headers.get("user-agent"),
+        request_path: new URL(request.url).pathname,
+        response_status: 200,
+      });
+      const settings = await D1.getSettings(db, link.operator_id);
+      await AuditService.notifyOperator(env, settings, `🧊 اشتراک دریافت شد: <b>${safeHtml(token)}</b>`);
+      return new Response(body, { headers: responseHeaders });
     }
 
-    const lastGood = getLastGood(cacheKey);
-    if (lastGood) {
-      return new Response(lastGood.body, { headers: lastGood.headers });
+    const lastGoodMem = getLastGoodMem(cacheKey);
+    if (lastGoodMem) return new Response(lastGoodMem.body, { headers: lastGoodMem.headers });
+
+    const lastGood = await D1.getLastKnownGood(db, link.operator_id, token);
+    if (lastGood?.body_b64) {
+      let headersParsed = DEFAULT_HEADERS;
+      try {
+        headersParsed = lastGood.headers_json ? JSON.parse(lastGood.headers_json) : DEFAULT_HEADERS;
+      } catch {
+        headersParsed = DEFAULT_HEADERS;
+      }
+      return new Response(utf8SafeDecode(lastGood.body_b64), { headers: headersParsed });
     }
-    return new Response("", { headers });
+    return new Response(utf8SafeEncode("# upstream_invalid"), {
+      headers: { ...DEFAULT_HEADERS, "x-sub-status": "empty" },
+      status: 200,
+    });
   },
   handleRedirect(url) {
     const target = url.searchParams.get("target");
@@ -982,7 +1074,7 @@ const Router = {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>مدیریت اشتراک شخصی</title>
+  <title>مدیریت اشتراک اپراتورها</title>
   <style>
     body { margin:0; font-family: "Vazirmatn", system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
     .wrap { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
@@ -996,10 +1088,10 @@ const Router = {
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>مدیریت اشتراک شخصی، شفاف و امن</h1>
-      <p class="muted">برای شروع، به ربات تلگرام وارد شوید و مراحل راه‌اندازی را انجام دهید.</p>
+      <h1>پنل اشتراک برند برای اپراتورها</h1>
+      <p class="muted">این سرویس فقط برای اپراتورهاست و کاربران نهایی با ربات تعامل ندارند.</p>
       <div class="grid">
-        <a class="glass-btn" href="https://t.me/">🧊 ورود به ربات</a>
+        <a class="glass-btn" href="https://t.me/">🧊 ورود اپراتور</a>
         <a class="glass-btn" href="${base}/health">🧊 وضعیت سلامت</a>
       </div>
     </div>
