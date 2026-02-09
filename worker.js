@@ -18,9 +18,16 @@ const APP = {
   maxOutputBytes: 2 * 1024 * 1024,
   maxOutputLines: 5000,
   notifyFetchIntervalMs: 5 * 60 * 1000,
+  notifyFetchDefault: 0,
   upstreamTimeoutMs: 8000,
   maxRedirects: 2,
   sessionTtlSec: 60 * 60 * 24,
+  snapshotTtlSec: 300,
+  auditSampleRate: 0.01,
+  upstreamMaxConcurrency: 3,
+  upstreamFailureThreshold: 3,
+  upstreamCooldownMs: 5 * 60 * 1000,
+  purgeRetentionDays: 30,
 };
 
 // =============================
@@ -45,6 +52,16 @@ const DEFAULT_HEADERS = {
   "cache-control": "no-store",
 };
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const HTML_HEADERS = {
+  "content-type": "text/html; charset=utf-8",
+  "cache-control": "no-store",
+  "x-frame-options": "DENY",
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "permissions-policy": "geolocation=(), microphone=(), camera=()",
+  "content-security-policy":
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://telegram.org; frame-src https://telegram.org; connect-src 'self'; base-uri 'none'; form-action 'self';",
+};
 
 const SUB_CACHE = new Map();
 const LAST_GOOD_MEM = new Map();
@@ -135,19 +152,40 @@ const getCachedSub = (key) => {
   return entry;
 };
 
-const setCachedSub = (key, body, headers) => {
+const setCachedSub = (key, body, headers, meta = {}) => {
   if (SUB_CACHE.size > APP.cacheMaxEntries) SUB_CACHE.clear();
-  SUB_CACHE.set(key, { body, headers, timestamp: Date.now() });
+  SUB_CACHE.set(key, { body, headers, timestamp: Date.now(), ...meta });
 };
 
-const setLastGoodMem = (key, body, headers) => {
+const setLastGoodMem = (key, body, headers, meta = {}) => {
   if (LAST_GOOD_MEM.size > APP.cacheMaxEntries) LAST_GOOD_MEM.clear();
-  LAST_GOOD_MEM.set(key, { body, headers, timestamp: Date.now() });
+  LAST_GOOD_MEM.set(key, { body, headers, timestamp: Date.now(), ...meta });
 };
 
 const getLastGoodMem = (key) => LAST_GOOD_MEM.get(key);
 
 const parseMessageText = (message) => message?.text?.trim() || "";
+
+const isSnapshotFresh = (snapshot) => {
+  if (!snapshot?.updated_at || !snapshot?.ttl_sec) return false;
+  const updated = Date.parse(snapshot.updated_at);
+  if (!Number.isFinite(updated)) return false;
+  return Date.now() - updated < snapshot.ttl_sec * 1000;
+};
+
+const mapWithConcurrency = async (items, limit, mapper) => {
+  const results = [];
+  let index = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }).map(async () => {
+    while (index < items.length) {
+      const current = index;
+      index += 1;
+      results[current] = await mapper(items[current], current);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+};
 
 const decodeCallbackData = (data) => {
   try {
@@ -196,6 +234,15 @@ const redactUrlForLog = (url) => {
     return parsed.toString();
   } catch {
     return url;
+  }
+};
+
+const redactUrlForDisplay = (url) => {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.hostname}/***`;
+  } catch {
+    return "***";
   }
 };
 
@@ -275,6 +322,8 @@ const parseAddExtra = (text) => {
 const jsonResponse = (payload, status = 200, headers = {}) =>
   new Response(JSON.stringify(payload), { status, headers: { ...JSON_HEADERS, ...headers } });
 
+const htmlResponse = (html, status = 200) => new Response(html, { status, headers: HTML_HEADERS });
+
 const parseJsonBody = async (request) => {
   if (!request.headers.get("content-type")?.includes("application/json")) return null;
   try {
@@ -293,6 +342,15 @@ const safeParseJson = (value, fallback = {}) => {
   }
 };
 
+const constantTimeEqual = (a, b) => {
+  const aBytes = new TextEncoder().encode(String(a || ""));
+  const bBytes = new TextEncoder().encode(String(b || ""));
+  if (aBytes.length !== bBytes.length) return false;
+  let diff = 0;
+  for (let i = 0; i < aBytes.length; i += 1) diff |= aBytes[i] ^ bBytes[i];
+  return diff === 0;
+};
+
 const base64UrlEncode = (data) =>
   btoa(String.fromCharCode(...new Uint8Array(data)))
     .replace(/\+/g, "-")
@@ -303,6 +361,50 @@ const base64UrlDecode = (data) => {
   const padded = data.replace(/-/g, "+").replace(/_/g, "/");
   const pad = padded.length % 4 === 0 ? padded : padded + "=".repeat(4 - (padded.length % 4));
   return Uint8Array.from(atob(pad), (c) => c.charCodeAt(0));
+};
+
+const base64Encode = (data) => btoa(String.fromCharCode(...new Uint8Array(data)));
+const base64Decode = (data) => Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+
+const getEncryptionSecret = (env) => env.ENCRYPTION_KEY || env.SESSION_SECRET || "";
+
+const deriveAesKey = async (secret) => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
+  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+};
+
+const encryptString = async (env, plainText) => {
+  const secret = getEncryptionSecret(env);
+  if (!secret) return plainText;
+  const key = await deriveAesKey(secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plainText));
+  return `enc:v1:${base64UrlEncode(iv)}:${base64UrlEncode(cipher)}`;
+};
+
+const decryptString = async (env, value) => {
+  if (!value || !value.startsWith("enc:v1:")) return value || "";
+  const secret = getEncryptionSecret(env);
+  if (!secret) return "";
+  const [, , ivB64, dataB64] = value.split(":");
+  if (!ivB64 || !dataB64) return "";
+  const key = await deriveAesKey(secret);
+  try {
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: base64UrlDecode(ivB64) }, key, base64UrlDecode(dataB64));
+    return new TextDecoder().decode(plain);
+  } catch {
+    return "";
+  }
+};
+
+const encryptUpstreamUrl = async (env, url) => {
+  if (!url) return "";
+  return encryptString(env, url);
+};
+
+const decryptUpstreamUrl = async (env, url) => {
+  if (!url) return "";
+  return decryptString(env, url);
 };
 
 const signSession = async (payload, secret) => {
@@ -339,6 +441,8 @@ const hashApiKey = async (value) => {
 
 const validateTelegramLogin = async (data, botToken) => {
   if (!data || !data.hash) return false;
+  const authDate = Number(data.auth_date || 0) * 1000;
+  if (!authDate || Date.now() - authDate > 10 * 60 * 1000) return false;
   const secret = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(botToken));
   const key = await crypto.subtle.importKey("raw", secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const checkString = Object.keys(data)
@@ -350,7 +454,7 @@ const validateTelegramLogin = async (data, botToken) => {
   const hash = Array.from(new Uint8Array(signature))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-  return hash === data.hash;
+  return constantTimeEqual(hash, data.hash);
 };
 
 const assertSafeUpstream = (url, allowlist = [], denylist = []) => {
@@ -540,7 +644,8 @@ const D1 = {
   async listUpstreamsAll(db, operatorId) {
     return db.prepare("SELECT * FROM operator_upstreams WHERE operator_id = ? ORDER BY priority DESC, created_at DESC").bind(operatorId).all();
   },
-  async createUpstream(db, operatorId, payload) {
+  async createUpstream(db, env, operatorId, payload) {
+    const encryptedUrl = await encryptUpstreamUrl(env, payload.url);
     await db
       .prepare(
         "INSERT INTO operator_upstreams (id, operator_id, url, enabled, weight, priority, headers_json, format_hint, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -548,7 +653,7 @@ const D1 = {
       .bind(
         crypto.randomUUID(),
         operatorId,
-        payload.url,
+        encryptedUrl,
         payload.enabled ? 1 : 0,
         payload.weight ?? 1,
         payload.priority ?? 0,
@@ -559,11 +664,13 @@ const D1 = {
       )
       .run();
   },
-  async updateUpstream(db, operatorId, upstreamId, patch) {
+  async updateUpstream(db, env, operatorId, upstreamId, patch) {
     const fields = Object.keys(patch);
     if (!fields.length) return;
+    const mutatedPatch = { ...patch };
+    if (mutatedPatch.url) mutatedPatch.url = await encryptUpstreamUrl(env, mutatedPatch.url);
     const setClause = fields.map((field) => `${field} = ?`).join(", ");
-    const values = fields.map((field) => patch[field]);
+    const values = fields.map((field) => mutatedPatch[field]);
     await db
       .prepare(`UPDATE operator_upstreams SET ${setClause}, updated_at = ? WHERE id = ? AND operator_id = ?`)
       .bind(...values, nowIso(), upstreamId, operatorId)
@@ -609,16 +716,87 @@ const D1 = {
       .bind(overrides ? JSON.stringify(overrides) : null, nowIso(), id, operatorId)
       .run();
   },
-  async upsertLastKnownGood(db, operatorId, token, bodyB64, headersJson) {
+  async upsertLastKnownGood(db, operatorId, token, bodyValue, bodyFormat, headersJson) {
     await db
       .prepare(
-        "INSERT INTO last_known_good (operator_id, public_token, body_b64, body_format, headers_json, updated_at) VALUES (?, ?, ?, 'base64_text', ?, ?) ON CONFLICT(operator_id, public_token) DO UPDATE SET body_b64 = excluded.body_b64, body_format = excluded.body_format, headers_json = excluded.headers_json, updated_at = excluded.updated_at"
+        "INSERT INTO last_known_good (operator_id, public_token, body_value, body_format, headers_json, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(operator_id, public_token) DO UPDATE SET body_value = excluded.body_value, body_format = excluded.body_format, headers_json = excluded.headers_json, updated_at = excluded.updated_at"
       )
-      .bind(operatorId, token, bodyB64, headersJson, nowIso())
+      .bind(operatorId, token, bodyValue, bodyFormat, headersJson, nowIso())
       .run();
   },
   async getLastKnownGood(db, operatorId, token) {
     return db.prepare("SELECT * FROM last_known_good WHERE operator_id = ? AND public_token = ?").bind(operatorId, token).first();
+  },
+  async upsertSnapshot(db, snapshot) {
+    await db
+      .prepare(
+        "INSERT INTO snapshots (token, operator_id, body_value, body_format, headers_json, updated_at, ttl_sec, quotas_json, notify_fetches, last_fetch_notify_at, channel_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(token) DO UPDATE SET body_value = excluded.body_value, body_format = excluded.body_format, headers_json = excluded.headers_json, updated_at = excluded.updated_at, ttl_sec = excluded.ttl_sec, operator_id = excluded.operator_id, quotas_json = excluded.quotas_json, notify_fetches = excluded.notify_fetches, last_fetch_notify_at = excluded.last_fetch_notify_at, channel_id = excluded.channel_id"
+      )
+      .bind(
+        snapshot.token,
+        snapshot.operator_id,
+        snapshot.body_value,
+        snapshot.body_format,
+        snapshot.headers_json,
+        snapshot.updated_at,
+        snapshot.ttl_sec,
+        snapshot.quotas_json || null,
+        snapshot.notify_fetches ?? APP.notifyFetchDefault,
+        snapshot.last_fetch_notify_at || null,
+        snapshot.channel_id || null
+      )
+      .run();
+  },
+  async getSnapshot(db, token) {
+    return db.prepare("SELECT * FROM snapshots WHERE token = ?").bind(token).first();
+  },
+  async getLatestSnapshotInfo(db, operatorId) {
+    return db
+      .prepare("SELECT token, updated_at, ttl_sec FROM snapshots WHERE operator_id = ? ORDER BY updated_at DESC LIMIT 1")
+      .bind(operatorId)
+      .first();
+  },
+  async bumpUpstreamFailure(db, upstreamId, failureCount, cooldownUntil) {
+    await db
+      .prepare(
+        "UPDATE operator_upstreams SET failure_count = ?, cooldown_until = ?, last_failure_at = ? WHERE id = ?"
+      )
+      .bind(failureCount, cooldownUntil, nowIso(), upstreamId)
+      .run();
+  },
+  async clearUpstreamFailure(db, upstreamId) {
+    await db
+      .prepare(
+        "UPDATE operator_upstreams SET failure_count = 0, cooldown_until = NULL, last_success_at = ? WHERE id = ?"
+      )
+      .bind(nowIso(), upstreamId)
+      .run();
+  },
+  async createNotifyJob(db, payload) {
+    await db
+      .prepare(
+        "INSERT INTO notify_jobs (id, operator_id, payload_json, status, attempts, available_at, created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?)"
+      )
+      .bind(crypto.randomUUID(), payload.operator_id || null, JSON.stringify(payload), Date.now(), nowIso(), nowIso())
+      .run();
+  },
+  async listNotifyJobs(db, limit = 10) {
+    return db
+      .prepare("SELECT * FROM notify_jobs WHERE status = 'pending' AND available_at <= ? ORDER BY created_at ASC LIMIT ?")
+      .bind(Date.now(), limit)
+      .all();
+  },
+  async updateNotifyJob(db, id, patch) {
+    const fields = Object.keys(patch);
+    if (!fields.length) return;
+    const setClause = fields.map((field) => `${field} = ?`).join(", ");
+    const values = fields.map((field) => patch[field]);
+    await db.prepare(`UPDATE notify_jobs SET ${setClause}, updated_at = ? WHERE id = ?`).bind(...values, nowIso(), id).run();
+  },
+  async purgeOldRecords(db, retentionMs) {
+    await db.prepare("DELETE FROM audit_logs WHERE created_at < ?").bind(new Date(Date.now() - retentionMs).toISOString()).run();
+    await db.prepare("DELETE FROM rate_limits WHERE updated_at < ?").bind(new Date(Date.now() - retentionMs).toISOString()).run();
+    await db.prepare("DELETE FROM notify_jobs WHERE created_at < ? AND status = 'done'").bind(new Date(Date.now() - retentionMs).toISOString()).run();
   },
   async createApiKey(db, operatorId, keyHash, scopesJson) {
     await db
@@ -715,21 +893,21 @@ const OperatorService = {
 };
 
 const SubscriptionAssembler = {
-  async assemble(env, db, operatorId, token, request, requestId, customerLink) {
-    const settings = await D1.getSettings(db, operatorId);
-    const baseRules = await D1.getRules(db, operatorId);
+  async assemble(env, db, operatorId, token, request, requestId, customerLink, preloaded = {}) {
+    const settings = preloaded.settings || (await D1.getSettings(db, operatorId));
+    const baseRules = preloaded.rules || (await D1.getRules(db, operatorId));
     const overrides = safeParseJson(customerLink?.overrides_json, {});
     const rules = { ...baseRules, ...overrides };
-    const extras = await D1.listEnabledExtras(db, operatorId);
+    const extras = preloaded.extras || (await D1.listEnabledExtras(db, operatorId));
     const selectedExtras = overrides?.extras?.length
       ? (extras?.results || []).filter((item) => overrides.extras.includes(item.id))
       : (extras?.results || []);
 
-    const upstreams = await D1.listUpstreams(db, operatorId);
+    const upstreams = preloaded.upstreams || (await D1.listUpstreams(db, operatorId));
     const allowlist = parseCommaList(settings?.upstream_allowlist);
     const denylist = parseCommaList(settings?.upstream_denylist);
 
-    const upstreamPayloads = await this.fetchUpstreams(upstreams?.results || [], allowlist, denylist);
+    const upstreamPayloads = await this.fetchUpstreams(env, db, upstreams?.results || [], allowlist, denylist);
     const selected = this.selectUpstreamsByPolicy(upstreamPayloads, rules?.merge_policy || "append");
     const extrasContent = selectedExtras.map((item) => item.content).join("\n");
 
@@ -766,44 +944,57 @@ const SubscriptionAssembler = {
       valid: true,
     };
   },
-  async fetchUpstreams(upstreams, allowlist, denylist) {
-    const results = [];
-    for (const upstream of upstreams) {
-      const validation = assertSafeUpstream(upstream.url, allowlist, denylist);
+  async fetchUpstreams(env, db, upstreams, allowlist, denylist) {
+    const now = Date.now();
+    const results = await mapWithConcurrency(upstreams, APP.upstreamMaxConcurrency, async (upstream) => {
+      const cooldownUntil = upstream.cooldown_until ? Date.parse(upstream.cooldown_until) : 0;
+      if (cooldownUntil && cooldownUntil > now) {
+        return { ok: false, status: 429, body: "", subscriptionUserinfo: null, isBase64: false, error: "cooldown", upstream };
+      }
+      const decryptedUrl = await decryptUpstreamUrl(env, upstream.url);
+      const validation = assertSafeUpstream(decryptedUrl, allowlist, denylist);
       if (!validation.ok) {
-        results.push({ ok: false, status: 400, body: "", subscriptionUserinfo: null, isBase64: false, error: validation.error, upstream });
-        continue;
+        return { ok: false, status: 400, body: "", subscriptionUserinfo: null, isBase64: false, error: validation.error, upstream };
       }
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), APP.upstreamTimeoutMs);
       try {
         const headers = upstream.headers_json ? JSON.parse(upstream.headers_json) : { "user-agent": "v2rayNG" };
         const res = await fetchWithRedirects(
-          upstream.url,
+          decryptedUrl,
           { cf: { cacheTtl: 0 }, signal: controller.signal, headers },
           APP.maxRedirects,
           (nextUrl) => assertSafeUpstream(nextUrl, allowlist, denylist)
         );
         const text = await res.text();
         if (new TextEncoder().encode(text).length > APP.maxOutputBytes) {
-          results.push({ ok: false, status: 413, body: "", subscriptionUserinfo: null, isBase64: false, error: "too_large", upstream });
-          continue;
+          return { ok: false, status: 413, body: "", subscriptionUserinfo: null, isBase64: false, error: "too_large", upstream };
         }
         clearTimeout(timeout);
-        results.push({
+        if (res.ok) {
+          await D1.clearUpstreamFailure(db, upstream.id);
+        } else {
+          const nextFailure = Math.min(APP.upstreamFailureThreshold, (upstream.failure_count || 0) + 1);
+          const cooldown = nextFailure >= APP.upstreamFailureThreshold ? new Date(Date.now() + APP.upstreamCooldownMs).toISOString() : null;
+          await D1.bumpUpstreamFailure(db, upstream.id, nextFailure, cooldown);
+        }
+        return {
           ok: res.ok,
           status: res.status,
           body: text,
           subscriptionUserinfo: res.headers.get("subscription-userinfo"),
           isBase64: looksLikeBase64(text),
           upstream,
-        });
+        };
       } catch (err) {
         clearTimeout(timeout);
-        Logger.warn("Upstream fetch failed", { error: err?.message, upstream: redactUrlForLog(upstream.url) });
-        results.push({ ok: false, status: 502, body: "", subscriptionUserinfo: null, isBase64: false, error: "fetch_failed", upstream });
+        Logger.warn("Upstream fetch failed", { error: err?.message, upstream: redactUrlForLog(decryptedUrl) });
+        const nextFailure = Math.min(APP.upstreamFailureThreshold, (upstream.failure_count || 0) + 1);
+        const cooldown = nextFailure >= APP.upstreamFailureThreshold ? new Date(Date.now() + APP.upstreamCooldownMs).toISOString() : null;
+        await D1.bumpUpstreamFailure(db, upstream.id, nextFailure, cooldown);
+        return { ok: false, status: 502, body: "", subscriptionUserinfo: null, isBase64: false, error: "fetch_failed", upstream };
       }
-    }
+    });
     return results;
   },
   selectUpstreamsByPolicy(results, policy) {
@@ -882,24 +1073,71 @@ const SubscriptionAssembler = {
   },
 };
 
+const NotificationService = {
+  async enqueue(env, payload) {
+    if (!payload?.messageHtml) return;
+    if (env.NOTIFY_QUEUE) {
+      await env.NOTIFY_QUEUE.send(payload);
+      return;
+    }
+    await D1.createNotifyJob(env.DB, payload);
+  },
+  async sendWithBackoff(env, payload, attempt = 0) {
+    const channelId = payload?.channel_id || env.LOG_CHANNEL_ID;
+    if (!channelId || !env.TELEGRAM_TOKEN) return false;
+    const maxAttempts = 4;
+    for (let i = attempt; i < maxAttempts; i += 1) {
+      try {
+        const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: channelId,
+            text: payload.messageHtml,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+          }),
+        });
+        if (res.ok) return true;
+      } catch (err) {
+        Logger.warn("Notify Telegram failed", { error: err?.message });
+      }
+      const delayMs = Math.min(30_000, 1000 * 2 ** i);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return false;
+  },
+  async processQueueMessage(env, message) {
+    const ok = await this.sendWithBackoff(env, message?.body || message);
+    if (!ok) throw new Error("notify_failed");
+  },
+  async processPendingJobs(env) {
+    const jobs = await D1.listNotifyJobs(env.DB, 20);
+    for (const job of jobs?.results || []) {
+      const payload = safeParseJson(job.payload_json, null);
+      const ok = await this.sendWithBackoff(env, payload, job.attempts || 0);
+      if (ok) {
+        await D1.updateNotifyJob(env.DB, job.id, { status: "done" });
+      } else {
+        const nextAttempts = (job.attempts || 0) + 1;
+        const delayMs = Math.min(60_000, 1000 * 2 ** nextAttempts);
+        await D1.updateNotifyJob(env.DB, job.id, {
+          attempts: nextAttempts,
+          available_at: Date.now() + delayMs,
+          status: "pending",
+        });
+      }
+    }
+  },
+};
+
 const AuditService = {
   async notifyOperator(env, settings, messageHtml) {
-    const channelId = settings?.channel_id || env.LOG_CHANNEL_ID;
-    if (!channelId || !env.TELEGRAM_TOKEN) return;
-    try {
-      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: channelId,
-          text: messageHtml,
-          parse_mode: "HTML",
-          disable_web_page_preview: true,
-        }),
-      });
-    } catch (err) {
-      Logger.warn("Notify Telegram failed", { error: err?.message });
-    }
+    await NotificationService.enqueue(env, {
+      operator_id: settings?.operator_id,
+      channel_id: settings?.channel_id,
+      messageHtml,
+    });
   },
 };
 
@@ -927,6 +1165,134 @@ const AuthService = {
     }
     return null;
   },
+};
+
+const SnapshotService = {
+  async getSnapshot(env, token) {
+    if (env.SNAP_KV) {
+      const entry = await env.SNAP_KV.get(token, "json");
+      return entry;
+    }
+    return D1.getSnapshot(env.DB, token);
+  },
+  async setSnapshot(env, snapshot) {
+    const payload = {
+      token: snapshot.token,
+      operator_id: snapshot.operator_id,
+      body_value: snapshot.body_value,
+      body_format: snapshot.body_format,
+      headers_json: snapshot.headers_json,
+      updated_at: snapshot.updated_at,
+      ttl_sec: snapshot.ttl_sec,
+      quotas_json: snapshot.quotas_json || null,
+      notify_fetches: snapshot.notify_fetches ?? APP.notifyFetchDefault,
+      last_fetch_notify_at: snapshot.last_fetch_notify_at || null,
+      channel_id: snapshot.channel_id || null,
+    };
+    if (env.SNAP_KV) {
+      await env.SNAP_KV.put(snapshot.token, JSON.stringify(payload), { expirationTtl: snapshot.ttl_sec });
+    }
+    await D1.upsertSnapshot(env.DB, snapshot);
+  },
+  async getLastKnownGood(env, operatorId, token) {
+    return D1.getLastKnownGood(env.DB, operatorId, token);
+  },
+};
+
+const buildSnapshotHeaders = (snapshot, requestId) => {
+  let headers = DEFAULT_HEADERS;
+  try {
+    headers = snapshot.headers_json ? JSON.parse(snapshot.headers_json) : DEFAULT_HEADERS;
+  } catch {
+    headers = DEFAULT_HEADERS;
+  }
+  return {
+    ...headers,
+    "content-disposition": headers["content-disposition"] || `inline; filename=sub_${snapshot.token}.txt`,
+    "x-request-id": requestId,
+    "cache-control": "no-store",
+  };
+};
+
+const buildSnapshotResponse = (snapshot, requestId) => {
+  const headers = buildSnapshotHeaders(snapshot, requestId);
+  return new Response(snapshot.body_value || "", { headers });
+};
+
+const refreshSnapshot = async (env, token, request, requestId) => {
+  const db = env.DB;
+  const link = await D1.getCustomerLinkByToken(db, token);
+  if (!link) return;
+  const operatorId = link.operator_id;
+  const [settings, rules, extras, upstreams] = await Promise.all([
+    D1.getSettings(db, operatorId),
+    D1.getRules(db, operatorId),
+    D1.listEnabledExtras(db, operatorId),
+    D1.listUpstreams(db, operatorId),
+  ]);
+  const assembled = await SubscriptionAssembler.assemble(env, db, operatorId, token, request, requestId, link, {
+    settings,
+    rules,
+    extras,
+    upstreams,
+  });
+  const responseHeadersBase = { ...assembled.headers, "content-disposition": `inline; filename=sub_${token}.txt` };
+  const bodyFormat = rules?.output_format === "plain" ? "plain" : "base64";
+  if (assembled.valid) {
+    const snapshot = {
+      token,
+      operator_id: operatorId,
+      body_value: assembled.body,
+      body_format: bodyFormat,
+      headers_json: JSON.stringify(responseHeadersBase),
+      updated_at: nowIso(),
+      ttl_sec: APP.snapshotTtlSec,
+      quotas_json: settings?.quotas_json || null,
+      notify_fetches: settings?.notify_fetches ?? APP.notifyFetchDefault,
+      last_fetch_notify_at: settings?.last_fetch_notify_at || null,
+      channel_id: settings?.channel_id || null,
+    };
+    setCachedSub(`sub:${token}`, assembled.body, responseHeadersBase, { snapshot });
+    setLastGoodMem(`sub:${token}`, assembled.body, responseHeadersBase, { body_format: bodyFormat });
+    await SnapshotService.setSnapshot(env, snapshot);
+    await D1.upsertLastKnownGood(db, operatorId, token, assembled.body, bodyFormat, JSON.stringify(responseHeadersBase));
+    const cacheUrl = new URL(`https://cache.internal/snap/${token}`);
+    const cacheHeaders = {
+      ...responseHeadersBase,
+      "cache-control": `max-age=${APP.snapshotTtlSec}`,
+      "x-snapshot-updated": snapshot.updated_at,
+      "x-snapshot-ttl": String(snapshot.ttl_sec),
+      "x-snapshot-format": snapshot.body_format,
+      "x-operator-id": snapshot.operator_id,
+      "x-snapshot-quotas": snapshot.quotas_json || "",
+      "x-snapshot-notify": String(snapshot.notify_fetches ?? APP.notifyFetchDefault),
+      "x-snapshot-last-notify": snapshot.last_fetch_notify_at || "",
+      "x-snapshot-channel": snapshot.channel_id || "",
+    };
+    await caches.default.put(cacheUrl, new Response(assembled.body, { headers: cacheHeaders, status: 200 }));
+    await D1.logAudit(db, {
+      operator_id: operatorId,
+      event_type: "snapshot_refresh_ok",
+      ip: request.headers.get("cf-connecting-ip"),
+      country: request.headers.get("cf-ipcountry"),
+      user_agent: request.headers.get("user-agent"),
+      request_path: new URL(request.url).pathname,
+      response_status: 200,
+      meta_json: JSON.stringify({ request_id: requestId }),
+    });
+  } else {
+    await D1.logAudit(db, {
+      operator_id: operatorId,
+      event_type: "snapshot_refresh_failed",
+      ip: request.headers.get("cf-connecting-ip"),
+      country: request.headers.get("cf-ipcountry"),
+      user_agent: request.headers.get("user-agent"),
+      request_path: new URL(request.url).pathname,
+      response_status: 502,
+      meta_json: JSON.stringify({ request_id: requestId }),
+    });
+    await AuditService.notifyOperator(env, settings, `⚠️ بروزرسانی اسنپ‌شات ناموفق بود برای <b>${safeHtml(settings?.branding || "اپراتور")}</b>.`);
+  }
 };
 
 // =============================
@@ -995,7 +1361,7 @@ const Telegram = {
     if (!text.startsWith("/") && settings?.pending_action) {
       const action = settings.pending_action;
       if (action === "set_upstream") {
-        await D1.createUpstream(db, operator.id, { url: text, enabled: true, weight: 1, priority: 1 });
+        await D1.createUpstream(db, env, operator.id, { url: text, enabled: true, weight: 1, priority: 1 });
         await D1.setPendingAction(db, operator.id, null, null);
         await D1.logAudit(db, {
           operator_id: operator.id,
@@ -1044,7 +1410,7 @@ const Telegram = {
         await this.sendMessage(env, message.chat.id, "📌 لطفاً لینک آپ‌استریم را بفرستید.");
         return new Response("ok");
       }
-      await D1.createUpstream(db, operator.id, { url: value, enabled: true, weight: 1, priority: 1 });
+      await D1.createUpstream(db, env, operator.id, { url: value, enabled: true, weight: 1, priority: 1 });
       await D1.logAudit(db, {
         operator_id: operator.id,
         event_type: "settings_update:upstream_url",
@@ -1287,12 +1653,17 @@ const Telegram = {
     const settings = await D1.getSettings(db, operator.id);
     const domains = await D1.listDomains(db, operator.id);
     const activeDomain = (domains?.results || []).find((item) => item.active);
+    const snapshot = await D1.getLatestSnapshotInfo(db, operator.id);
+    const snapshotFresh = snapshot && isSnapshotFresh(snapshot) ? "تازه" : "نیازمند بروزرسانی";
     const shareLink = await OperatorService.getShareLink(db, operator, env.BASE_URL || "");
     const text = `
 ${GLASS} <b>پنل اپراتور</b>
 
 👤 اپراتور: <code>${safeHtml(operator.display_name || operator.telegram_user_id)}</code>
 🌐 دامنه فعال: <code>${safeHtml(activeDomain?.domain || "ثبت نشده")}</code>
+✅ تایید دامنه: <code>${activeDomain?.verified ? "تایید شد" : activeDomain ? "در انتظار" : "نامشخص"}</code>
+⚡ وضعیت آپ‌استریم: <code>${safeHtml(settings?.last_upstream_status || "-")}</code> (${safeHtml(settings?.last_upstream_at || "-")})
+🧾 آخرین اسنپ‌شات: <code>${safeHtml(snapshot?.updated_at || "-")}</code> (${snapshotFresh})
 🔗 لینک اشتراک: <code>${safeHtml(shareLink)}</code>
 
 دستورات اصلی:
@@ -1310,16 +1681,16 @@ ${GLASS} <b>پنل اپراتور</b>
     const keyboard = {
       inline_keyboard: [
         [
-          { text: GLASS_BTN("تنظیم آپ‌استریم"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_upstream" })) },
-          { text: GLASS_BTN("تنظیم دامنه"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_domain" })) },
+          { text: GLASS_BTN("مدیریت آپ‌استریم‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_upstream" })) },
+          { text: GLASS_BTN("تایید دامنه"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_domain" })) },
         ],
         [
-          { text: GLASS_BTN("مشاهده لینک"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_link" })) },
-          { text: GLASS_BTN("افزودنی‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_extras" })) },
+          { text: GLASS_BTN("مدیریت لینک‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_link" })) },
+          { text: GLASS_BTN("مدیریت افزودنی‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_extras" })) },
         ],
         [
           { text: GLASS_BTN("قوانین"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_rules" })) },
-          { text: GLASS_BTN("کانال"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_channel" })) },
+          { text: GLASS_BTN("اعلان‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_channel" })) },
         ],
       ],
     };
@@ -1335,13 +1706,17 @@ ${GLASS} <b>پنل اپراتور</b>
     const activeDomain = settings?.active_domain_id ? await D1.getDomainById(db, settings.active_domain_id) : null;
     const extrasCount = await D1.countExtraConfigs(db, operator.id);
     const rules = await D1.getRules(db, operator.id);
+    const snapshot = await D1.getLatestSnapshotInfo(db, operator.id);
+    const snapshotFresh = snapshot && isSnapshotFresh(snapshot) ? "تازه" : "نیازمند بروزرسانی";
     const text = `
 ${GLASS} <b>لینک اشتراک برند شما</b>
 
 <code>${safeHtml(link)}</code>
 
 دامنه فعال: ${safeHtml(activeDomain?.domain || "-")}
+تایید دامنه: ${activeDomain?.verified ? "تایید شد" : activeDomain ? "در انتظار" : "-"}
 وضعیت آپ‌استریم: ${safeHtml(settings?.last_upstream_status || "-")} (${safeHtml(settings?.last_upstream_at || "-")})
+وضعیت اسنپ‌شات: ${safeHtml(snapshot?.updated_at || "-")} (${snapshotFresh})
 افزودنی‌ها: ${extrasCount?.count || 0}
 Merge policy: ${safeHtml(rules?.merge_policy || "append")}
     `.trim();
@@ -1459,7 +1834,7 @@ ${items || "فعلاً لاگی ثبت نشده."}
 // HTTP Router
 // =============================
 const Router = {
-  async handle(request, env) {
+  async handle(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/webhook") {
       return Telegram.handleWebhook(request, env);
@@ -1469,7 +1844,7 @@ const Router = {
     }
     if (request.method === "GET" && url.pathname.startsWith("/sub/")) {
       const token = url.pathname.split("/").pop();
-      return this.handleSubscription(request, env, token);
+      return this.handleSubscription(request, env, token, ctx);
     }
     if (request.method === "GET" && url.pathname === "/redirect") {
       return this.handleRedirect(url);
@@ -1483,6 +1858,9 @@ const Router = {
     if (request.method === "GET" && url.pathname === "/api/v1/health/full") {
       return this.handleHealthFull(env);
     }
+    if (request.method === "POST" && url.pathname === "/admin/purge") {
+      return this.handlePurge(request, env);
+    }
     if (url.pathname.startsWith("/api/v1/")) {
       return this.handleApi(request, env);
     }
@@ -1490,6 +1868,15 @@ const Router = {
       return this.handleLanding(request, env);
     }
     return new Response("not found", { status: 404 });
+  },
+  async handlePurge(request, env) {
+    const ctx = await AuthService.getAuthContext(request, env, env.DB);
+    if (!ctx || !isAdmin(ctx.operator.telegram_user_id, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+    const url = new URL(request.url);
+    const days = Number(url.searchParams.get("days") || APP.purgeRetentionDays);
+    const retentionMs = Math.max(1, days) * 24 * 60 * 60 * 1000;
+    await D1.purgeOldRecords(env.DB, retentionMs);
+    return jsonResponse({ ok: true, retention_days: days });
   },
   async handleTelegramLogin(request, env) {
     if (!env.TELEGRAM_TOKEN || !env.SESSION_SECRET) {
@@ -1531,12 +1918,18 @@ const Router = {
     const path = url.pathname.replace("/api/v1", "");
     if (request.method === "GET" && path === "/operators/me/upstreams") {
       const data = await D1.listUpstreamsAll(env.DB, operator.id);
-      return jsonResponse({ ok: true, data: data?.results || [] });
+      const masked = await Promise.all(
+        (data?.results || []).map(async (item) => {
+          const plainUrl = await decryptUpstreamUrl(env, item.url);
+          return { ...item, url: redactUrlForDisplay(plainUrl) };
+        })
+      );
+      return jsonResponse({ ok: true, data: masked });
     }
     if (request.method === "POST" && path === "/operators/me/upstreams") {
       const body = await parseJsonBody(request);
       if (!body?.url) return jsonResponse({ ok: false, error: "invalid_body" }, 400);
-      await D1.createUpstream(env.DB, operator.id, body);
+      await D1.createUpstream(env.DB, env, operator.id, body);
       await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_upstream_create" });
       return jsonResponse({ ok: true });
     }
@@ -1556,6 +1949,23 @@ const Router = {
     if (request.method === "GET" && path === "/operators/me/customer-links") {
       const links = await D1.listCustomerLinks(env.DB, operator.id);
       return jsonResponse({ ok: true, data: links?.results || [] });
+    }
+    if (request.method === "GET" && path === "/operators/me/status") {
+      const settings = await D1.getSettings(env.DB, operator.id);
+      const domains = await D1.listDomains(env.DB, operator.id);
+      const activeDomain = (domains?.results || []).find((item) => item.active);
+      const snapshot = await D1.getLatestSnapshotInfo(env.DB, operator.id);
+      return jsonResponse({
+        ok: true,
+        data: {
+          last_upstream_status: settings?.last_upstream_status || null,
+          last_upstream_at: settings?.last_upstream_at || null,
+          domain_status: activeDomain?.verified ? "verified" : activeDomain ? "pending" : "unset",
+          domain_name: activeDomain?.domain || null,
+          snapshot_updated_at: snapshot?.updated_at || null,
+          snapshot_ttl_sec: snapshot?.ttl_sec || null,
+        },
+      });
     }
     if (request.method === "POST" && path.startsWith("/operators/me/customer-links/") && path.endsWith("/rotate")) {
       const id = path.split("/")[4];
@@ -1597,19 +2007,72 @@ const Router = {
     }
     return jsonResponse({ ok: false, error: "not_found" }, 404);
   },
-  async handleSubscription(request, env, token) {
+  async handleSubscription(request, env, token, ctx) {
     const requestId = crypto.randomUUID();
     const cacheKey = `sub:${token}`;
     const db = env.DB;
-    const link = await D1.getCustomerLinkByToken(db, token);
-    if (!link) return new Response("not found", { status: 404 });
+    let link = null;
+    let snapshot = null;
+    let cachedBody = null;
+    let cachedHeaders = null;
+    let cacheSource = null;
 
-    const ip = request.headers.get("cf-connecting-ip") || "unknown";
-    const settings = await D1.getSettings(db, link.operator_id);
-    const quotas = safeParseJson(settings?.quotas_json, {});
+    const cached = getCachedSub(cacheKey);
+    if (cached?.snapshot) {
+      snapshot = cached.snapshot;
+      cachedBody = cached.body;
+      cachedHeaders = cached.headers;
+      cacheSource = "memory";
+    }
+
+    if (!snapshot || !isSnapshotFresh(snapshot)) {
+      const cacheUrl = new URL(`https://cache.internal/snap/${token}`);
+      const cache = caches.default;
+      const cachedResponse = await cache.match(cacheUrl);
+      if (cachedResponse) {
+        const body = await cachedResponse.text();
+        const headers = Object.fromEntries(cachedResponse.headers.entries());
+        snapshot = {
+          token,
+          operator_id: headers["x-operator-id"],
+          body_value: body,
+          body_format: headers["x-snapshot-format"] || "base64",
+          headers_json: JSON.stringify(headers),
+          updated_at: headers["x-snapshot-updated"] || nowIso(),
+          ttl_sec: Number(headers["x-snapshot-ttl"] || APP.snapshotTtlSec),
+          quotas_json: headers["x-snapshot-quotas"] || null,
+          notify_fetches: headers["x-snapshot-notify"] ? Number(headers["x-snapshot-notify"]) : APP.notifyFetchDefault,
+          last_fetch_notify_at: headers["x-snapshot-last-notify"] || null,
+          channel_id: headers["x-snapshot-channel"] || null,
+        };
+        cachedBody = body;
+        cachedHeaders = headers;
+        cacheSource = "edge";
+        setCachedSub(cacheKey, body, headers, { snapshot });
+      }
+    }
+
+    if (!snapshot) {
+      snapshot = await SnapshotService.getSnapshot(env, token);
+      if (snapshot) {
+        cachedBody = snapshot.body_value;
+        cachedHeaders = buildSnapshotHeaders(snapshot, requestId);
+        cacheSource = env.SNAP_KV ? "kv" : "db";
+        setCachedSub(cacheKey, snapshot.body_value, cachedHeaders, { snapshot });
+      }
+    }
+
+    if (!snapshot?.operator_id) {
+      link = await D1.getCustomerLinkByToken(db, token);
+      if (!link) return new Response("not found", { status: 404 });
+    }
+    const operatorId = snapshot?.operator_id || link.operator_id;
+    const settings = snapshot?.quotas_json ? null : await D1.getSettings(db, operatorId);
+    const quotas = safeParseJson(snapshot?.quotas_json || settings?.quotas_json, {});
     const perIp = quotas?.per_ip ?? APP.rateLimitMax;
     const perToken = quotas?.per_token ?? APP.rateLimitMax;
     const perOperator = quotas?.per_operator ?? APP.rateLimitMax * 10;
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
 
     if (!rateLimit(`sub-ip:${ip}`)) {
       const ok = await D1.bumpRateLimit(db, `sub-ip:${ip}`, APP.rateLimitWindowMs, perIp);
@@ -1619,90 +2082,100 @@ const Router = {
       const ok = await D1.bumpRateLimit(db, `sub-token:${token}`, APP.rateLimitWindowMs, perToken);
       if (!ok) return new Response("rate limit", { status: 429 });
     }
-    if (!rateLimit(`sub-op:${link.operator_id}`)) {
-      const ok = await D1.bumpRateLimit(db, `sub-op:${link.operator_id}`, APP.rateLimitWindowMs, perOperator);
+    if (!rateLimit(`sub-op:${operatorId}`)) {
+      const ok = await D1.bumpRateLimit(db, `sub-op:${operatorId}`, APP.rateLimitWindowMs, perOperator);
       if (!ok) return new Response("rate limit", { status: 429 });
     }
 
-    const cached = getCachedSub(cacheKey);
-    if (cached) {
-      await D1.logAudit(db, {
-        operator_id: link.operator_id,
-        event_type: "subscription_fetch",
-        ip: request.headers.get("cf-connecting-ip"),
-        country: request.headers.get("cf-ipcountry"),
-        user_agent: request.headers.get("user-agent"),
-        request_path: new URL(request.url).pathname,
-        response_status: 200,
-        meta_json: JSON.stringify({ cache: "memory", request_id: requestId }),
-      });
-      return new Response(cached.body, { headers: { ...cached.headers, "x-request-id": requestId } });
-    }
-
-    const cacheUrl = new URL(`https://cache.internal/sub/${token}`);
-    const cache = caches.default;
-    const cachedResponse = await cache.match(cacheUrl);
-    if (cachedResponse) {
-      const body = await cachedResponse.text();
-      const cachedHeaders = Object.fromEntries(cachedResponse.headers.entries());
-      cachedHeaders["cache-control"] = "no-store";
-      cachedHeaders["content-disposition"] = cachedHeaders["content-disposition"] || `inline; filename=sub_${token}.txt`;
-      setCachedSub(cacheKey, body, cachedHeaders);
-      await D1.logAudit(db, {
-        operator_id: link.operator_id,
-        event_type: "subscription_fetch",
-        ip: request.headers.get("cf-connecting-ip"),
-        country: request.headers.get("cf-ipcountry"),
-        user_agent: request.headers.get("user-agent"),
-        request_path: new URL(request.url).pathname,
-        response_status: 200,
-        meta_json: JSON.stringify({ cache: "edge", request_id: requestId }),
-      });
-      return new Response(body, { headers: { ...cachedHeaders, "x-request-id": requestId } });
-    }
-
-    const { body, headers, valid } = await SubscriptionAssembler.assemble(env, db, link.operator_id, token, request, requestId, link);
-    const responseHeadersBase = { ...headers, "content-disposition": `inline; filename=sub_${token}.txt` };
-    const clientHeaders = { ...responseHeadersBase, "x-request-id": requestId, "cache-control": "no-store" };
-    const cacheHeaders = { ...responseHeadersBase, "cache-control": "max-age=60" };
-    if (valid) {
-      setCachedSub(cacheKey, body, clientHeaders);
-      setLastGoodMem(cacheKey, body, clientHeaders);
-      await cache.put(cacheUrl, new Response(body, { headers: cacheHeaders, status: 200 }));
-      await D1.upsertLastKnownGood(db, link.operator_id, token, body, JSON.stringify(cacheHeaders));
-      await D1.logAudit(db, {
-        operator_id: link.operator_id,
-        event_type: "subscription_fetch",
-        ip: request.headers.get("cf-connecting-ip"),
-        country: request.headers.get("cf-ipcountry"),
-        user_agent: request.headers.get("user-agent"),
-        request_path: new URL(request.url).pathname,
-        response_status: 200,
-        meta_json: JSON.stringify({ cache: "origin", request_id: requestId }),
-      });
-      if (settings?.notify_fetches !== 0) {
-        const last = settings?.last_fetch_notify_at ? Date.parse(settings.last_fetch_notify_at) : 0;
+    if (snapshot && cachedBody && isSnapshotFresh(snapshot)) {
+      const notifyFetches = snapshot?.notify_fetches ?? settings?.notify_fetches ?? APP.notifyFetchDefault;
+      if (notifyFetches !== 0) {
+        const lastAt = snapshot?.last_fetch_notify_at || settings?.last_fetch_notify_at;
+        const last = lastAt ? Date.parse(lastAt) : 0;
         if (Date.now() - last > APP.notifyFetchIntervalMs) {
-          await AuditService.notifyOperator(env, settings, `🧊 اشتراک دریافت شد: <b>${safeHtml(token)}</b>`);
-          await D1.updateSettings(db, link.operator_id, { last_fetch_notify_at: nowIso() });
+          await AuditService.notifyOperator(env, settings || { operator_id: operatorId, channel_id: snapshot?.channel_id }, `🧊 اشتراک دریافت شد: <b>${safeHtml(token)}</b>`);
+          await D1.updateSettings(db, operatorId, { last_fetch_notify_at: nowIso() });
         }
       }
-      return new Response(body, { headers: clientHeaders });
+      if (Math.random() < APP.auditSampleRate) {
+        await D1.logAudit(db, {
+          operator_id: operatorId,
+          event_type: "subscription_fetch",
+          ip,
+          country: request.headers.get("cf-ipcountry"),
+          user_agent: request.headers.get("user-agent"),
+          request_path: new URL(request.url).pathname,
+          response_status: 200,
+          meta_json: JSON.stringify({ cache: cacheSource || "snapshot", request_id: requestId }),
+        });
+      }
+      return new Response(cachedBody, { headers: { ...cachedHeaders, "x-request-id": requestId } });
     }
 
-    const lastGoodMem = getLastGoodMem(cacheKey);
-    if (lastGoodMem) return new Response(lastGoodMem.body, { headers: { ...lastGoodMem.headers, "x-request-id": requestId } });
+    if (ctx) ctx.waitUntil(refreshSnapshot(env, token, request, requestId));
 
-    const lastGood = await D1.getLastKnownGood(db, link.operator_id, token);
-    if (lastGood?.body_b64) {
+    const lastGoodMem = getLastGoodMem(cacheKey);
+    if (lastGoodMem) {
+      await D1.logAudit(db, {
+        operator_id: operatorId,
+        event_type: "subscription_fallback",
+        ip,
+        country: request.headers.get("cf-ipcountry"),
+        user_agent: request.headers.get("user-agent"),
+        request_path: new URL(request.url).pathname,
+        response_status: 200,
+        meta_json: JSON.stringify({ cache: "memory_lkg", request_id: requestId }),
+      });
+      return new Response(lastGoodMem.body, { headers: { ...lastGoodMem.headers, "x-request-id": requestId } });
+    }
+
+    const lastGood = await SnapshotService.getLastKnownGood(env, operatorId, token);
+    if (lastGood?.body_value) {
       let headersParsed = DEFAULT_HEADERS;
       try {
         headersParsed = lastGood.headers_json ? JSON.parse(lastGood.headers_json) : DEFAULT_HEADERS;
       } catch {
         headersParsed = DEFAULT_HEADERS;
       }
-      return new Response(lastGood.body_b64, { headers: { ...headersParsed, "x-request-id": requestId } });
+      const body = lastGood.body_value;
+      setLastGoodMem(cacheKey, body, headersParsed, { body_format: lastGood.body_format });
+      await D1.logAudit(db, {
+        operator_id: operatorId,
+        event_type: "subscription_fallback",
+        ip,
+        country: request.headers.get("cf-ipcountry"),
+        user_agent: request.headers.get("user-agent"),
+        request_path: new URL(request.url).pathname,
+        response_status: 200,
+        meta_json: JSON.stringify({ cache: "lkg", request_id: requestId }),
+      });
+      return new Response(body, { headers: { ...headersParsed, "x-request-id": requestId } });
     }
+
+    if (snapshot) {
+      await D1.logAudit(db, {
+        operator_id: operatorId,
+        event_type: "subscription_fallback",
+        ip,
+        country: request.headers.get("cf-ipcountry"),
+        user_agent: request.headers.get("user-agent"),
+        request_path: new URL(request.url).pathname,
+        response_status: 200,
+        meta_json: JSON.stringify({ cache: "stale_snapshot", request_id: requestId }),
+      });
+      return buildSnapshotResponse(snapshot, requestId);
+    }
+
+    await D1.logAudit(db, {
+      operator_id: operatorId,
+      event_type: "subscription_error",
+      ip,
+      country: request.headers.get("cf-ipcountry"),
+      user_agent: request.headers.get("user-agent"),
+      request_path: new URL(request.url).pathname,
+      response_status: 502,
+      meta_json: JSON.stringify({ reason: "no_snapshot", request_id: requestId }),
+    });
     return new Response(utf8SafeEncode("# upstream_invalid"), {
       headers: { ...DEFAULT_HEADERS, "x-request-id": requestId },
       status: 200,
@@ -1803,6 +2276,11 @@ const Router = {
     .muted { color: rgba(226,232,240,0.7); }
     .panel { margin-top: 18px; padding: 16px; background: rgba(15,23,42,0.6); border-radius: 16px; }
     input { width:100%; padding:10px 12px; border-radius: 12px; border:1px solid rgba(255,255,255,0.2); background: rgba(15,23,42,0.6); color: #fff; }
+    .hidden { display:none; }
+    .links { margin-top: 12px; display:flex; flex-direction:column; gap:12px; }
+    .link-row { display:flex; flex-direction:column; gap:8px; padding:12px; border-radius: 14px; background: rgba(15,23,42,0.5); }
+    .badge { display:inline-flex; padding:4px 8px; border-radius:999px; background: rgba(255,255,255,0.12); font-size:12px; }
+    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; }
   </style>
 </head>
 <body>
@@ -1810,10 +2288,18 @@ const Router = {
     <div class="card">
       <h1>پنل اشتراک برند برای اپراتورها</h1>
       <p class="muted">ورود از طریق Telegram Login Widget و کد دعوت مدیر.</p>
-      <div class="panel">
+      <div class="panel" id="login-panel">
         <div id="telegram-login"></div>
         <p class="muted">کد دعوت (اختیاری)</p>
         <input id="invite-code" placeholder="Invite code" />
+      </div>
+      <div class="panel hidden" id="dashboard">
+        <div class="row">
+          <strong>داشبورد اپراتور</strong>
+          <button class="glass-btn" id="logout-btn">خروج</button>
+        </div>
+        <p class="muted" id="status-text">در حال دریافت اطلاعات...</p>
+        <div class="links" id="links"></div>
       </div>
       <div class="grid">
         <a class="glass-btn" href="https://t.me/${botUsername}">🧊 ورود از تلگرام</a>
@@ -1823,6 +2309,77 @@ const Router = {
   </div>
   <script>
     const inviteInput = document.getElementById('invite-code');
+    const dashboard = document.getElementById('dashboard');
+    const loginPanel = document.getElementById('login-panel');
+    const linksEl = document.getElementById('links');
+    const statusText = document.getElementById('status-text');
+    const logoutBtn = document.getElementById('logout-btn');
+    const tokenKey = 'osm_session_token';
+
+    const setToken = (token) => localStorage.setItem(tokenKey, token);
+    const getToken = () => localStorage.getItem(tokenKey);
+    const clearToken = () => localStorage.removeItem(tokenKey);
+
+    const apiFetch = async (path, options = {}) => {
+      const token = getToken();
+      const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+      const res = await fetch('${base}' + path, { ...options, headers });
+      return res.json();
+    };
+
+    const renderDashboard = async () => {
+      loginPanel.classList.add('hidden');
+      dashboard.classList.remove('hidden');
+      const [linksRes, statusRes] = await Promise.all([
+        apiFetch('/api/v1/operators/me/customer-links'),
+        apiFetch('/api/v1/operators/me/status'),
+      ]);
+      if (!linksRes.ok) {
+        statusText.textContent = 'خطا در دریافت لینک‌ها';
+        return;
+      }
+      const status = statusRes.ok ? statusRes.data : {};
+      statusText.textContent = `وضعیت آپ‌استریم: ${status.last_upstream_status || '-'} | دامنه: ${status.domain_status || '-'} | آخرین اسنپ‌شات: ${status.snapshot_updated_at || '-'}`;
+      linksEl.innerHTML = '';
+      (linksRes.data || []).forEach((link) => {
+        const row = document.createElement('div');
+        row.className = 'link-row';
+        const url = '${base}/sub/' + link.public_token;
+        row.innerHTML = \`
+          <div class="row">
+            <span class="badge">\${link.label || 'مشتری'}</span>
+            <span class="muted">\${link.enabled ? 'فعال' : 'غیرفعال'}</span>
+          </div>
+          <div class="muted">\${url}</div>
+          <div class="row">
+            <button class="glass-btn" data-copy="\${url}">کپی لینک</button>
+            <button class="glass-btn" data-rotate="\${link.id}">چرخش لینک</button>
+          </div>
+        \`;
+        linksEl.appendChild(row);
+      });
+      linksEl.querySelectorAll('button[data-copy]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          await navigator.clipboard.writeText(btn.dataset.copy);
+          alert('کپی شد');
+        });
+      });
+      linksEl.querySelectorAll('button[data-rotate]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const res = await apiFetch('/api/v1/operators/me/customer-links/' + btn.dataset.rotate + '/rotate', { method: 'POST' });
+          if (res.ok) renderDashboard();
+          else alert('خطا در چرخش');
+        });
+      });
+    };
+
+    logoutBtn.addEventListener('click', () => {
+      clearToken();
+      dashboard.classList.add('hidden');
+      loginPanel.classList.remove('hidden');
+    });
+
     window.onTelegramAuth = async (user) => {
       const payload = { ...user, invite_code: inviteInput.value || undefined };
       const res = await fetch('${base}/auth/telegram', {
@@ -1832,16 +2389,21 @@ const Router = {
       });
       const data = await res.json();
       if (data.ok) {
-        alert('ورود موفق: ' + data.status);
+        setToken(data.token);
+        await renderDashboard();
       } else {
         alert('خطا: ' + data.error);
       }
     };
+
+    if (getToken()) {
+      renderDashboard();
+    }
   </script>
   <script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="${botUsername}" data-size="large" data-userpic="false" data-onauth="onTelegramAuth(user)" data-request-access="write"></script>
 </body>
 </html>`;
-    return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+    return htmlResponse(html);
   },
 };
 
@@ -1854,12 +2416,23 @@ export const TestUtils = {
 };
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
-      return await Router.handle(request, env);
+      return await Router.handle(request, env, ctx);
     } catch (err) {
       Logger.error("Unhandled error", err);
       return new Response("server error", { status: 500 });
+    }
+  },
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(D1.purgeOldRecords(env.DB, APP.purgeRetentionDays * 24 * 60 * 60 * 1000));
+    if (!env.NOTIFY_QUEUE) {
+      ctx.waitUntil(NotificationService.processPendingJobs(env));
+    }
+  },
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      await NotificationService.processQueueMessage(env, message);
     }
   },
 };
