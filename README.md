@@ -24,7 +24,7 @@ This service is a multi-tenant subscription manager for VPN sellers/operators. I
 - **Health/Doctor**: `/health`, `/api/v1/health/full`, and `scripts/doctor.js`
 
 ### Snapshot-based `/sub` architecture
-- `/sub/:token` serves a precomputed snapshot (KV/Cache/D1) whenever possible.
+- `/sub/:panel_token` (on verified custom domain) or `/sub/:operator_token/:panel_token` (on worker domain) serves a precomputed snapshot (KV/Cache/D1) whenever possible.
 - If the snapshot is missing or stale, the Worker returns the last-known-good response immediately and refreshes in the background.
 - Snapshot refresh performs all upstream fetch and rule processing, then stores:
   - `body_value`, `body_format` (`plain` or `base64`)
@@ -156,6 +156,7 @@ Optional:
 - `TELEGRAM_BOT_USERNAME`
 - `LOG_CHANNEL_ID`
 - `BASE_URL`
+- `NATIONAL_BASE_URL` (optional secondary base for “Meli/National” links)
 - `SNAP_KV` (KV namespace for snapshots at scale)
 - `NOTIFY_QUEUE` (Queue binding for Telegram notifications)
 - `ENCRYPTION_KEY` (optional override key for upstream URL encryption)
@@ -171,3 +172,13 @@ Run tests:
 ```
 npm test
 ```
+
+## E2E Test Plan
+
+### Telegram smart paste
+- Operator pastes a panel subscription URL → bot replies with premium Persian message, branded link, and one-click buttons (no “unknown command”).
+- When no upstream is configured → upstream status shows `unset` in `/panel` and `/link`.
+
+### Link routing
+- Verified domain present → subscription link uses `/sub/<PANEL_TOKEN>`.
+- No verified domain → subscription link uses `/sub/<OPERATOR_TOKEN>/<PANEL_TOKEN>`.
