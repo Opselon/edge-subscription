@@ -67,14 +67,150 @@ const SUB_CACHE = new Map();
 const LAST_GOOD_MEM = new Map();
 const RATE_LIMIT = new Map();
 
-const Logger = {
-  info: (msg, data = {}) => console.log(JSON.stringify({ level: "INFO", msg, ...data, ts: new Date().toISOString() })),
-  warn: (msg, data = {}) => console.warn(JSON.stringify({ level: "WARN", msg, ...data, ts: new Date().toISOString() })),
-  error: (msg, err, data = {}) =>
-    console.error(
-      JSON.stringify({ level: "ERROR", msg, error: err?.message || String(err), ...data, ts: new Date().toISOString() })
-    ),
+const ERROR_CODES = {
+  E_AUTH_UNAUTHORIZED: {
+    reason: "auth_unauthorized",
+    hints: ["Validate auth headers", "Ensure session token is valid and unexpired"],
+  },
+  E_AUTH_FORBIDDEN: {
+    reason: "auth_forbidden",
+    hints: ["Check operator permissions", "Verify admin role"],
+  },
+  E_INPUT_INVALID: {
+    reason: "input_invalid",
+    hints: ["Validate request payload", "Check required fields"],
+  },
+  E_JSON_PARSE: {
+    reason: "json_parse_failed",
+    hints: ["Validate JSON format", "Ensure content-type is application/json"],
+  },
+  E_DB_QUERY: {
+    reason: "db_query_failed",
+    hints: ["Check D1 binding", "Validate SQL syntax", "Inspect database availability"],
+  },
+  E_UPSTREAM_FETCH: {
+    reason: "upstream_fetch_failed",
+    hints: ["Validate upstream URL", "Check network connectivity", "Inspect upstream response"],
+  },
+  E_UPSTREAM_INVALID: {
+    reason: "upstream_invalid",
+    hints: ["Check upstream response content", "Verify subscription format"],
+  },
+  E_SSRF_BLOCKED: {
+    reason: "ssrf_blocked",
+    hints: ["Verify allowlist/denylist", "Check upstream host safety"],
+  },
+  E_RATE_LIMIT: {
+    reason: "rate_limited",
+    hints: ["Reduce request rate", "Check per-token quotas"],
+  },
+  E_TELEGRAM_API: {
+    reason: "telegram_api_error",
+    hints: ["Check Telegram token", "Inspect Telegram API response"],
+  },
+  E_INTERNAL: {
+    reason: "internal_error",
+    hints: ["Check logs for stack trace", "Inspect recent deployments"],
+  },
 };
+
+const LOG_LEVELS = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40 };
+const ERROR_CLASSIFICATION = {
+  E_AUTH_UNAUTHORIZED: "auth",
+  E_AUTH_FORBIDDEN: "auth",
+  E_INPUT_INVALID: "input",
+  E_JSON_PARSE: "input",
+  E_DB_QUERY: "db",
+  E_UPSTREAM_FETCH: "upstream",
+  E_UPSTREAM_INVALID: "upstream",
+  E_SSRF_BLOCKED: "security",
+  E_RATE_LIMIT: "throttle",
+  E_TELEGRAM_API: "external",
+  E_INTERNAL: "internal",
+};
+
+const truncateStack = (stack, maxLines = 12) => {
+  if (!stack) return null;
+  return String(stack).split("\n").slice(0, maxLines).join("\n");
+};
+
+const normalizeError = (err) => {
+  if (!err) {
+    return { name: "Error", message: "Unknown error", stack: null, cause_chain: [] };
+  }
+  const base = {
+    name: err.name || "Error",
+    message: err.message || String(err),
+    stack: truncateStack(err.stack),
+    cause_chain: [],
+  };
+  let current = err;
+  for (let i = 0; i < 5; i += 1) {
+    if (!current?.cause) break;
+    current = current.cause;
+    base.cause_chain.push({
+      name: current?.name || "Error",
+      message: current?.message || String(current),
+      stack: truncateStack(current?.stack),
+    });
+  }
+  return base;
+};
+
+const createLogger = (env, baseContext = {}) => {
+  const levelName = String(env?.LOG_LEVEL || "INFO").toUpperCase();
+  const threshold = LOG_LEVELS[levelName] ?? LOG_LEVELS.INFO;
+  const write = (level, msg, data = {}) => {
+    if (LOG_LEVELS[level] < threshold) return;
+    const payload = { level, msg, ts: new Date().toISOString(), ...baseContext, ...data };
+    const line = JSON.stringify(payload);
+    if (level === "ERROR") {
+      console.error(line);
+    } else if (level === "WARN") {
+      console.warn(line);
+    } else {
+      console.log(line);
+    }
+  };
+  const logger = {
+    debug: (msg, data = {}) => write("DEBUG", msg, data),
+    info: (msg, data = {}) => write("INFO", msg, data),
+    warn: (msg, data = {}) => write("WARN", msg, data),
+    error: (msg, err, ctx = {}) => {
+      const { reason, error_code, hints, http_status, classification, ...rest } = ctx;
+      const code = error_code || "E_INTERNAL";
+      write("ERROR", msg, {
+        ...rest,
+        reason: reason || (ERROR_CODES[code] || ERROR_CODES.E_INTERNAL).reason,
+        error_code: code,
+        classification: classification || ERROR_CLASSIFICATION[code] || "internal",
+        hints: hints || (ERROR_CODES[code] || ERROR_CODES.E_INTERNAL).hints,
+        ...(http_status ? { http_status } : {}),
+        error: normalizeError(err),
+      });
+    },
+    child: (ctx = {}) => createLogger(env, { ...baseContext, ...ctx }),
+    span: (name, ctx = {}) => {
+      const start = Date.now();
+      const spanLogger = createLogger(env, { ...baseContext, span: name, ...ctx });
+      return {
+        end: (successCtx = {}) =>
+          spanLogger.info("span_end", { duration_ms: Date.now() - start, ...successCtx }),
+        fail: (err, failCtx = {}) =>
+          spanLogger.error("span_fail", err, {
+            duration_ms: Date.now() - start,
+            error_code: failCtx.error_code || "E_INTERNAL",
+            reason: failCtx.reason || ERROR_CODES.E_INTERNAL.reason,
+            hints: failCtx.hints || ERROR_CODES.E_INTERNAL.hints,
+            ...failCtx,
+          }),
+      };
+    },
+  };
+  return logger;
+};
+
+const Logger = createLogger();
 
 // =============================
 // Utilities (encoding, validation, safe HTML)
@@ -187,12 +323,9 @@ const mapWithConcurrency = async (items, limit, mapper) => {
   return results;
 };
 
-const decodeCallbackData = (data) => {
-  try {
-    return JSON.parse(utf8SafeDecode(data));
-  } catch {
-    return { action: data };
-  }
+const decodeCallbackData = (data, logger) => {
+  const decoded = utf8SafeDecode(data);
+  return safeJsonParse(decoded, { action: data }, logger, { error_code: "E_JSON_PARSE" });
 };
 
 const parseRulesArgs = (text) => {
@@ -224,16 +357,31 @@ const isValidSubscriptionText = (text) => {
   return /:\/\//.test(trimmed);
 };
 
+const redactPathSegments = (pathname) =>
+  pathname
+    .split("/")
+    .map((segment) => {
+      if (!segment) return segment;
+      if (segment.startsWith("bot") && segment.length > 6) return "bot***";
+      if (/^[0-9a-f-]{16,}$/i.test(segment)) return "***";
+      if (/^[A-Za-z0-9_-]{24,}$/.test(segment)) return "***";
+      return segment;
+    })
+    .join("/");
+
 const redactUrlForLog = (url) => {
   try {
     const parsed = new URL(url);
-    const sensitive = ["token", "key", "pass", "auth", "jwt"];
+    const sensitive = ["token", "key", "pass", "auth", "jwt", "session", "code"];
     for (const key of sensitive) {
       if (parsed.searchParams.has(key)) parsed.searchParams.set(key, "***");
     }
+    parsed.username = "";
+    parsed.password = "";
+    parsed.pathname = redactPathSegments(parsed.pathname);
     return parsed.toString();
   } catch {
-    return url;
+    return "***";
   }
 };
 
@@ -243,6 +391,71 @@ const redactUrlForDisplay = (url) => {
     return `${parsed.protocol}//${parsed.hostname}/***`;
   } catch {
     return "***";
+  }
+};
+
+const scrubPathForLog = (pathname) => {
+  if (pathname.startsWith("/sub/")) return "/sub/:token";
+  if (pathname.startsWith("/verify-domain/")) return "/verify-domain/:id";
+  if (pathname.startsWith("/api/v1/operators/me/customer-links/") && pathname.endsWith("/rotate")) {
+    return "/api/v1/operators/me/customer-links/:id/rotate";
+  }
+  if (pathname.startsWith("/admin/operators/") && pathname.endsWith("/approve")) {
+    return "/admin/operators/:id/approve";
+  }
+  return redactPathSegments(pathname);
+};
+
+const buildRequestContext = (request, requestId) => {
+  const url = new URL(request.url);
+  return {
+    request_id: requestId,
+    route: scrubPathForLog(url.pathname),
+    method: request.method,
+    cf_ray: request.headers.get("cf-ray") || null,
+    ip: request.headers.get("cf-connecting-ip") || null,
+    country: request.headers.get("cf-ipcountry") || null,
+  };
+};
+
+const getHeaderNames = (headers) => {
+  const names = [];
+  const redacted = [];
+  const sensitive = new Set(["authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"]);
+  if (!headers) return { header_names: names, redacted };
+  for (const [key] of headers.entries()) {
+    const lower = key.toLowerCase();
+    names.push(lower);
+    if (sensitive.has(lower) || lower.includes("token") || lower.includes("secret")) {
+      redacted.push(lower);
+    }
+  }
+  return { header_names: names, redacted };
+};
+
+const withRequestLogger = async (request, env, fn) => {
+  const requestId = crypto.randomUUID();
+  const baseLogger = createLogger(env);
+  const context = buildRequestContext(request, requestId);
+  const logger = baseLogger.child(context);
+  const url = new URL(request.url);
+  const start = Date.now();
+  logger.info("request_start", {
+    query_keys: Array.from(url.searchParams.keys()),
+    user_agent: request.headers.get("user-agent") || null,
+  });
+  try {
+    const response = await fn(logger, requestId);
+    logger.info("request_end", { status: response?.status || 200, duration_ms: Date.now() - start });
+    return response;
+  } catch (err) {
+    logger.error("request_failed", err, {
+      error_code: "E_INTERNAL",
+      reason: ERROR_CODES.E_INTERNAL.reason,
+      hints: ERROR_CODES.E_INTERNAL.hints,
+    });
+    logger.info("request_end", { status: 500, duration_ms: Date.now() - start });
+    return new Response("server error", { status: 500, headers: { "x-request-id": requestId } });
   }
 };
 
@@ -324,21 +537,119 @@ const jsonResponse = (payload, status = 200, headers = {}) =>
 
 const htmlResponse = (html, status = 200) => new Response(html, { status, headers: HTML_HEADERS });
 
-const parseJsonBody = async (request) => {
-  if (!request.headers.get("content-type")?.includes("application/json")) return null;
-  try {
-    return await request.json();
-  } catch {
-    return null;
-  }
-};
-
-const safeParseJson = (value, fallback = {}) => {
+const safeJsonParse = (value, fallback = {}, logger, meta = {}) => {
   if (!value) return fallback;
   try {
     return JSON.parse(value);
-  } catch {
+  } catch (err) {
+    const inputLength = typeof value === "string" ? value.length : 0;
+    const log = logger || Logger;
+    log.error("json_parse_failed", err, {
+      ...meta,
+      error_code: "E_JSON_PARSE",
+      reason: ERROR_CODES.E_JSON_PARSE.reason,
+      hints: ERROR_CODES.E_JSON_PARSE.hints,
+      input_length: inputLength,
+    });
     return fallback;
+  }
+};
+
+const safeParseJson = safeJsonParse;
+
+const parseJsonBody = async (request, logger) => {
+  if (!request.headers.get("content-type")?.includes("application/json")) return null;
+  const bodyText = await request.text();
+  if (!bodyText) return null;
+  return safeJsonParse(bodyText, null, logger, { error_code: "E_JSON_PARSE" });
+};
+
+const dbFirst = async (db, label, executor, logger, meta = {}) => {
+  const start = Date.now();
+  try {
+    const result = await executor();
+    (logger || Logger).debug("db_first", { label, duration_ms: Date.now() - start, ...meta });
+    return result;
+  } catch (err) {
+    (logger || Logger).error("db_query_failed", err, {
+      label,
+      duration_ms: Date.now() - start,
+      error_code: "E_DB_QUERY",
+      reason: ERROR_CODES.E_DB_QUERY.reason,
+      hints: ERROR_CODES.E_DB_QUERY.hints,
+      ...meta,
+    });
+    throw err;
+  }
+};
+
+const dbAll = async (db, label, executor, logger, meta = {}) => {
+  const start = Date.now();
+  try {
+    const result = await executor();
+    (logger || Logger).debug("db_all", { label, duration_ms: Date.now() - start, ...meta });
+    return result;
+  } catch (err) {
+    (logger || Logger).error("db_query_failed", err, {
+      label,
+      duration_ms: Date.now() - start,
+      error_code: "E_DB_QUERY",
+      reason: ERROR_CODES.E_DB_QUERY.reason,
+      hints: ERROR_CODES.E_DB_QUERY.hints,
+      ...meta,
+    });
+    throw err;
+  }
+};
+
+const dbRun = async (db, label, executor, logger, meta = {}) => {
+  const start = Date.now();
+  try {
+    const result = await executor();
+    (logger || Logger).debug("db_run", { label, duration_ms: Date.now() - start, ...meta });
+    return result;
+  } catch (err) {
+    (logger || Logger).error("db_query_failed", err, {
+      label,
+      duration_ms: Date.now() - start,
+      error_code: "E_DB_QUERY",
+      reason: ERROR_CODES.E_DB_QUERY.reason,
+      hints: ERROR_CODES.E_DB_QUERY.hints,
+      ...meta,
+    });
+    throw err;
+  }
+};
+
+const fetchWithLogs = async (url, options = {}, meta = {}, logger) => {
+  const start = Date.now();
+  const log = logger || Logger;
+  const redactedUrl = redactUrlForLog(url);
+  log.info("fetch_start", {
+    url: redactedUrl,
+    method: options.method || "GET",
+    ...meta,
+    ...getHeaderNames(new Headers(options.headers || {})),
+  });
+  try {
+    const res = await fetch(url, options);
+    log.info("fetch_end", {
+      url: redactedUrl,
+      status: res.status,
+      duration_ms: Date.now() - start,
+      ...meta,
+    });
+    return res;
+  } catch (err) {
+    log.error("fetch_failed", err, {
+      url: redactedUrl,
+      duration_ms: Date.now() - start,
+      error_code: meta.error_code || "E_UPSTREAM_FETCH",
+      reason: meta.reason || ERROR_CODES.E_UPSTREAM_FETCH.reason,
+      hints: meta.hints || ERROR_CODES.E_UPSTREAM_FETCH.hints,
+      ...meta,
+    });
+    throw err;
   }
 };
 
@@ -472,15 +783,30 @@ const assertSafeUpstream = (url, allowlist = [], denylist = []) => {
   return { ok: true };
 };
 
-const fetchWithRedirects = async (url, options, maxRedirects, validateUrl) => {
+const fetchWithRedirects = async (url, options, maxRedirects, validateUrl, logger) => {
   let currentUrl = url;
   for (let i = 0; i <= maxRedirects; i += 1) {
-    const res = await fetch(currentUrl, { ...options, redirect: "manual" });
+    const res = await fetchWithLogs(
+      currentUrl,
+      { ...options, redirect: "manual" },
+      { label: "fetch_redirect", error_code: "E_UPSTREAM_FETCH" },
+      logger
+    );
     if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
       const nextUrl = new URL(res.headers.get("location"), currentUrl).toString();
       if (validateUrl) {
         const check = validateUrl(nextUrl);
-        if (!check.ok) return new Response("blocked", { status: 403 });
+        if (!check.ok) {
+          (logger || Logger).warn("redirect_blocked", {
+            error_code: "E_SSRF_BLOCKED",
+            reason: ERROR_CODES.E_SSRF_BLOCKED.reason,
+            hints: ERROR_CODES.E_SSRF_BLOCKED.hints,
+            from_url: redactUrlForLog(currentUrl),
+            to_url: redactUrlForLog(nextUrl),
+            blocked_reason: check.error,
+          });
+          return new Response("blocked", { status: 403 });
+        }
       }
       currentUrl = nextUrl;
       continue;
@@ -494,374 +820,621 @@ const fetchWithRedirects = async (url, options, maxRedirects, validateUrl) => {
 // Data Access Layer (D1 queries)
 // =============================
 const D1 = {
-  async getOperatorByTelegramId(db, telegramUserId) {
-    return db.prepare("SELECT * FROM operators WHERE telegram_user_id = ?").bind(telegramUserId).first();
+  async getOperatorByTelegramId(db, telegramUserId, logger) {
+    return dbFirst(
+      db,
+      "operators.get_by_telegram_id",
+      () => db.prepare("SELECT * FROM operators WHERE telegram_user_id = ?").bind(telegramUserId).first(),
+      logger
+    );
   },
-  async getOperatorById(db, operatorId) {
-    return db.prepare("SELECT * FROM operators WHERE id = ?").bind(operatorId).first();
+  async getOperatorById(db, operatorId, logger) {
+    return dbFirst(db, "operators.get_by_id", () => db.prepare("SELECT * FROM operators WHERE id = ?").bind(operatorId).first(), logger);
   },
-  async listOperators(db) {
-    return db.prepare("SELECT * FROM operators ORDER BY created_at DESC").all();
+  async listOperators(db, logger) {
+    return dbAll(db, "operators.list", () => db.prepare("SELECT * FROM operators ORDER BY created_at DESC").all(), logger);
   },
-  async createOperator(db, telegramUserId, displayName, role = "operator", status = "pending") {
+  async createOperator(db, telegramUserId, displayName, role = "operator", status = "pending", logger) {
     const id = crypto.randomUUID();
-    await db
-      .prepare(
-        "INSERT INTO operators (id, telegram_user_id, display_name, role, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-      )
-      .bind(id, telegramUserId, displayName || null, role, status, nowIso(), nowIso())
-      .run();
-    await db
-      .prepare("INSERT INTO operator_settings (operator_id, created_at, updated_at) VALUES (?, ?, ?)")
-      .bind(id, nowIso(), nowIso())
-      .run();
-    await db
-      .prepare("INSERT INTO subscription_rules (operator_id, created_at, updated_at) VALUES (?, ?, ?)")
-      .bind(id, nowIso(), nowIso())
-      .run();
-    await db
-      .prepare("INSERT INTO customer_links (id, operator_id, public_token, enabled, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)")
-      .bind(crypto.randomUUID(), id, crypto.randomUUID(), nowIso(), nowIso())
-      .run();
-    return this.getOperatorByTelegramId(db, telegramUserId);
+    await dbRun(
+      db,
+      "operators.create",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO operators (id, telegram_user_id, display_name, role, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+          )
+          .bind(id, telegramUserId, displayName || null, role, status, nowIso(), nowIso())
+          .run(),
+      logger
+    );
+    await dbRun(
+      db,
+      "operator_settings.create",
+      () => db.prepare("INSERT INTO operator_settings (operator_id, created_at, updated_at) VALUES (?, ?, ?)").bind(id, nowIso(), nowIso()).run(),
+      logger
+    );
+    await dbRun(
+      db,
+      "subscription_rules.create",
+      () => db.prepare("INSERT INTO subscription_rules (operator_id, created_at, updated_at) VALUES (?, ?, ?)").bind(id, nowIso(), nowIso()).run(),
+      logger
+    );
+    await dbRun(
+      db,
+      "customer_links.create",
+      () =>
+        db
+          .prepare("INSERT INTO customer_links (id, operator_id, public_token, enabled, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)")
+          .bind(crypto.randomUUID(), id, crypto.randomUUID(), nowIso(), nowIso())
+          .run(),
+      logger
+    );
+    return this.getOperatorByTelegramId(db, telegramUserId, logger);
   },
-  async updateOperatorStatus(db, operatorId, status) {
-    await db.prepare("UPDATE operators SET status = ?, updated_at = ? WHERE id = ?").bind(status, nowIso(), operatorId).run();
+  async updateOperatorStatus(db, operatorId, status, logger) {
+    await dbRun(
+      db,
+      "operators.update_status",
+      () => db.prepare("UPDATE operators SET status = ?, updated_at = ? WHERE id = ?").bind(status, nowIso(), operatorId).run(),
+      logger
+    );
   },
-  async removeOperator(db, telegramUserId) {
-    await db
-      .prepare("UPDATE operators SET status = 'removed', updated_at = ? WHERE telegram_user_id = ?")
-      .bind(nowIso(), telegramUserId)
-      .run();
+  async removeOperator(db, telegramUserId, logger) {
+    await dbRun(
+      db,
+      "operators.remove",
+      () =>
+        db
+          .prepare("UPDATE operators SET status = 'removed', updated_at = ? WHERE telegram_user_id = ?")
+          .bind(nowIso(), telegramUserId)
+          .run(),
+      logger
+    );
   },
-  async touchOperator(db, operatorId) {
-    await db.prepare("UPDATE operators SET updated_at = ? WHERE id = ?").bind(nowIso(), operatorId).run();
+  async touchOperator(db, operatorId, logger) {
+    await dbRun(db, "operators.touch", () => db.prepare("UPDATE operators SET updated_at = ? WHERE id = ?").bind(nowIso(), operatorId).run(), logger);
   },
-  async getSettings(db, operatorId) {
-    return db.prepare("SELECT * FROM operator_settings WHERE operator_id = ?").bind(operatorId).first();
+  async getSettings(db, operatorId, logger) {
+    return dbFirst(
+      db,
+      "operator_settings.get",
+      () => db.prepare("SELECT * FROM operator_settings WHERE operator_id = ?").bind(operatorId).first(),
+      logger
+    );
   },
-  async updateSettings(db, operatorId, patch) {
+  async updateSettings(db, operatorId, patch, logger) {
     const fields = Object.keys(patch);
     if (!fields.length) return;
     const setClause = fields.map((field) => `${field} = ?`).join(", ");
     const values = fields.map((field) => patch[field]);
-    await db
-      .prepare(`UPDATE operator_settings SET ${setClause}, updated_at = ? WHERE operator_id = ?`)
-      .bind(...values, nowIso(), operatorId)
-      .run();
+    await dbRun(
+      db,
+      "operator_settings.update",
+      () => db.prepare(`UPDATE operator_settings SET ${setClause}, updated_at = ? WHERE operator_id = ?`).bind(...values, nowIso(), operatorId).run(),
+      logger
+    );
   },
-  async setPendingAction(db, operatorId, action, meta = null) {
-    await db
-      .prepare("UPDATE operator_settings SET pending_action = ?, pending_meta = ?, updated_at = ? WHERE operator_id = ?")
-      .bind(action, meta ? JSON.stringify(meta) : null, nowIso(), operatorId)
-      .run();
+  async setPendingAction(db, operatorId, action, meta = null, logger) {
+    await dbRun(
+      db,
+      "operator_settings.set_pending_action",
+      () =>
+        db
+          .prepare("UPDATE operator_settings SET pending_action = ?, pending_meta = ?, updated_at = ? WHERE operator_id = ?")
+          .bind(action, meta ? JSON.stringify(meta) : null, nowIso(), operatorId)
+          .run(),
+      logger
+    );
   },
-  async listDomains(db, operatorId) {
-    return db.prepare("SELECT * FROM domains WHERE operator_id = ? AND deleted_at IS NULL ORDER BY created_at DESC").bind(operatorId).all();
+  async listDomains(db, operatorId, logger) {
+    return dbAll(
+      db,
+      "domains.list",
+      () => db.prepare("SELECT * FROM domains WHERE operator_id = ? AND deleted_at IS NULL ORDER BY created_at DESC").bind(operatorId).all(),
+      logger
+    );
   },
-  async createDomain(db, operatorId, domain) {
-    await db
-      .prepare(
-        "INSERT INTO domains (id, operator_id, domain, verified, token, active, created_at, updated_at) VALUES (?, ?, ?, 0, ?, 1, ?, ?)"
-      )
-      .bind(crypto.randomUUID(), operatorId, domain, crypto.randomUUID(), nowIso(), nowIso())
-      .run();
+  async createDomain(db, operatorId, domain, logger) {
+    await dbRun(
+      db,
+      "domains.create",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO domains (id, operator_id, domain, verified, token, active, created_at, updated_at) VALUES (?, ?, ?, 0, ?, 1, ?, ?)"
+          )
+          .bind(crypto.randomUUID(), operatorId, domain, crypto.randomUUID(), nowIso(), nowIso())
+          .run(),
+      logger
+    );
   },
-  async setDomainActive(db, operatorId, domainId) {
-    await db
-      .prepare("UPDATE operator_settings SET active_domain_id = ?, updated_at = ? WHERE operator_id = ?")
-      .bind(domainId, nowIso(), operatorId)
-      .run();
-    await db.prepare("UPDATE domains SET active = 0 WHERE operator_id = ?").bind(operatorId).run();
-    await db.prepare("UPDATE domains SET active = 1 WHERE id = ? AND operator_id = ?").bind(domainId, operatorId).run();
+  async setDomainActive(db, operatorId, domainId, logger) {
+    await dbRun(
+      db,
+      "domains.set_active",
+      () => db.prepare("UPDATE operator_settings SET active_domain_id = ?, updated_at = ? WHERE operator_id = ?").bind(domainId, nowIso(), operatorId).run(),
+      logger
+    );
+    await dbRun(db, "domains.set_inactive", () => db.prepare("UPDATE domains SET active = 0 WHERE operator_id = ?").bind(operatorId).run(), logger);
+    await dbRun(
+      db,
+      "domains.set_active_row",
+      () => db.prepare("UPDATE domains SET active = 1 WHERE id = ? AND operator_id = ?").bind(domainId, operatorId).run(),
+      logger
+    );
   },
-  async updateDomainVerified(db, domainId, verified) {
-    await db.prepare("UPDATE domains SET verified = ?, updated_at = ? WHERE id = ?").bind(verified ? 1 : 0, nowIso(), domainId).run();
+  async updateDomainVerified(db, domainId, verified, logger) {
+    await dbRun(
+      db,
+      "domains.update_verified",
+      () => db.prepare("UPDATE domains SET verified = ?, updated_at = ? WHERE id = ?").bind(verified ? 1 : 0, nowIso(), domainId).run(),
+      logger
+    );
   },
-  async getDomainById(db, domainId) {
-    return db.prepare("SELECT * FROM domains WHERE id = ? AND deleted_at IS NULL").bind(domainId).first();
+  async getDomainById(db, domainId, logger) {
+    return dbFirst(db, "domains.get_by_id", () => db.prepare("SELECT * FROM domains WHERE id = ? AND deleted_at IS NULL").bind(domainId).first(), logger);
   },
-  async listExtraConfigs(db, operatorId, limit = 5, offset = 0) {
-    return db
-      .prepare("SELECT * FROM extra_configs WHERE operator_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at LIMIT ? OFFSET ?")
-      .bind(operatorId, limit, offset)
-      .all();
+  async listExtraConfigs(db, operatorId, limit = 5, offset = 0, logger) {
+    return dbAll(
+      db,
+      "extra_configs.list",
+      () =>
+        db
+          .prepare("SELECT * FROM extra_configs WHERE operator_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at LIMIT ? OFFSET ?")
+          .bind(operatorId, limit, offset)
+          .all(),
+      logger
+    );
   },
-  async listEnabledExtras(db, operatorId) {
-    return db
-      .prepare("SELECT * FROM extra_configs WHERE operator_id = ? AND deleted_at IS NULL AND enabled = 1 ORDER BY sort_order, created_at")
-      .bind(operatorId)
-      .all();
+  async listEnabledExtras(db, operatorId, logger) {
+    return dbAll(
+      db,
+      "extra_configs.list_enabled",
+      () =>
+        db
+          .prepare("SELECT * FROM extra_configs WHERE operator_id = ? AND deleted_at IS NULL AND enabled = 1 ORDER BY sort_order, created_at")
+          .bind(operatorId)
+          .all(),
+      logger
+    );
   },
-  async countExtraConfigs(db, operatorId) {
-    return db.prepare("SELECT COUNT(*) as count FROM extra_configs WHERE operator_id = ? AND deleted_at IS NULL").bind(operatorId).first();
+  async countExtraConfigs(db, operatorId, logger) {
+    return dbFirst(
+      db,
+      "extra_configs.count",
+      () => db.prepare("SELECT COUNT(*) as count FROM extra_configs WHERE operator_id = ? AND deleted_at IS NULL").bind(operatorId).first(),
+      logger
+    );
   },
-  async createExtraConfig(db, operatorId, title, content) {
-    await db
-      .prepare(
-        "INSERT INTO extra_configs (id, operator_id, title, content, enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, ?, ?)"
-      )
-      .bind(crypto.randomUUID(), operatorId, title || null, content, nowIso(), nowIso())
-      .run();
+  async createExtraConfig(db, operatorId, title, content, logger) {
+    await dbRun(
+      db,
+      "extra_configs.create",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO extra_configs (id, operator_id, title, content, enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, ?, ?)"
+          )
+          .bind(crypto.randomUUID(), operatorId, title || null, content, nowIso(), nowIso())
+          .run(),
+      logger
+    );
   },
-  async updateExtraConfig(db, operatorId, configId, content) {
-    await db
-      .prepare("UPDATE extra_configs SET content = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
-      .bind(content, nowIso(), configId, operatorId)
-      .run();
+  async updateExtraConfig(db, operatorId, configId, content, logger) {
+    await dbRun(
+      db,
+      "extra_configs.update",
+      () => db.prepare("UPDATE extra_configs SET content = ?, updated_at = ? WHERE id = ? AND operator_id = ?").bind(content, nowIso(), configId, operatorId).run(),
+      logger
+    );
   },
-  async setExtraEnabled(db, operatorId, configId, enabled) {
-    await db
-      .prepare("UPDATE extra_configs SET enabled = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
-      .bind(enabled ? 1 : 0, nowIso(), configId, operatorId)
-      .run();
+  async setExtraEnabled(db, operatorId, configId, enabled, logger) {
+    await dbRun(
+      db,
+      "extra_configs.set_enabled",
+      () => db.prepare("UPDATE extra_configs SET enabled = ?, updated_at = ? WHERE id = ? AND operator_id = ?").bind(enabled ? 1 : 0, nowIso(), configId, operatorId).run(),
+      logger
+    );
   },
-  async deleteExtraConfig(db, operatorId, configId) {
-    await db
-      .prepare("UPDATE extra_configs SET deleted_at = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
-      .bind(nowIso(), nowIso(), configId, operatorId)
-      .run();
+  async deleteExtraConfig(db, operatorId, configId, logger) {
+    await dbRun(
+      db,
+      "extra_configs.delete",
+      () => db.prepare("UPDATE extra_configs SET deleted_at = ?, updated_at = ? WHERE id = ? AND operator_id = ?").bind(nowIso(), nowIso(), configId, operatorId).run(),
+      logger
+    );
   },
-  async getRules(db, operatorId) {
-    return db.prepare("SELECT * FROM subscription_rules WHERE operator_id = ?").bind(operatorId).first();
+  async getRules(db, operatorId, logger) {
+    return dbFirst(db, "subscription_rules.get", () => db.prepare("SELECT * FROM subscription_rules WHERE operator_id = ?").bind(operatorId).first(), logger);
   },
-  async updateRules(db, operatorId, patch) {
+  async updateRules(db, operatorId, patch, logger) {
     const fields = Object.keys(patch);
     if (!fields.length) return;
     const setClause = fields.map((field) => `${field} = ?`).join(", ");
     const values = fields.map((field) => patch[field]);
-    await db
-      .prepare(`UPDATE subscription_rules SET ${setClause}, updated_at = ? WHERE operator_id = ?`)
-      .bind(...values, nowIso(), operatorId)
-      .run();
+    await dbRun(
+      db,
+      "subscription_rules.update",
+      () => db.prepare(`UPDATE subscription_rules SET ${setClause}, updated_at = ? WHERE operator_id = ?`).bind(...values, nowIso(), operatorId).run(),
+      logger
+    );
   },
-  async listUpstreams(db, operatorId) {
-    return db
-      .prepare("SELECT * FROM operator_upstreams WHERE operator_id = ? AND enabled = 1 ORDER BY priority DESC, created_at DESC")
-      .bind(operatorId)
-      .all();
+  async listUpstreams(db, operatorId, logger) {
+    return dbAll(
+      db,
+      "operator_upstreams.list_enabled",
+      () =>
+        db
+          .prepare("SELECT * FROM operator_upstreams WHERE operator_id = ? AND enabled = 1 ORDER BY priority DESC, created_at DESC")
+          .bind(operatorId)
+          .all(),
+      logger
+    );
   },
-  async listUpstreamsAll(db, operatorId) {
-    return db.prepare("SELECT * FROM operator_upstreams WHERE operator_id = ? ORDER BY priority DESC, created_at DESC").bind(operatorId).all();
+  async listUpstreamsAll(db, operatorId, logger) {
+    return dbAll(
+      db,
+      "operator_upstreams.list_all",
+      () => db.prepare("SELECT * FROM operator_upstreams WHERE operator_id = ? ORDER BY priority DESC, created_at DESC").bind(operatorId).all(),
+      logger
+    );
   },
-  async createUpstream(db, env, operatorId, payload) {
+  async createUpstream(db, env, operatorId, payload, logger) {
     const encryptedUrl = await encryptUpstreamUrl(env, payload.url);
-    await db
-      .prepare(
-        "INSERT INTO operator_upstreams (id, operator_id, url, enabled, weight, priority, headers_json, format_hint, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      )
-      .bind(
-        crypto.randomUUID(),
-        operatorId,
-        encryptedUrl,
-        payload.enabled ? 1 : 0,
-        payload.weight ?? 1,
-        payload.priority ?? 0,
-        payload.headers_json || null,
-        payload.format_hint || null,
-        nowIso(),
-        nowIso()
-      )
-      .run();
+    await dbRun(
+      db,
+      "operator_upstreams.create",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO operator_upstreams (id, operator_id, url, enabled, weight, priority, headers_json, format_hint, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          )
+          .bind(
+            crypto.randomUUID(),
+            operatorId,
+            encryptedUrl,
+            payload.enabled ? 1 : 0,
+            payload.weight ?? 1,
+            payload.priority ?? 0,
+            payload.headers_json || null,
+            payload.format_hint || null,
+            nowIso(),
+            nowIso()
+          )
+          .run(),
+      logger
+    );
   },
-  async updateUpstream(db, env, operatorId, upstreamId, patch) {
+  async updateUpstream(db, env, operatorId, upstreamId, patch, logger) {
     const fields = Object.keys(patch);
     if (!fields.length) return;
     const mutatedPatch = { ...patch };
     if (mutatedPatch.url) mutatedPatch.url = await encryptUpstreamUrl(env, mutatedPatch.url);
     const setClause = fields.map((field) => `${field} = ?`).join(", ");
     const values = fields.map((field) => mutatedPatch[field]);
-    await db
-      .prepare(`UPDATE operator_upstreams SET ${setClause}, updated_at = ? WHERE id = ? AND operator_id = ?`)
-      .bind(...values, nowIso(), upstreamId, operatorId)
-      .run();
+    await dbRun(
+      db,
+      "operator_upstreams.update",
+      () => db.prepare(`UPDATE operator_upstreams SET ${setClause}, updated_at = ? WHERE id = ? AND operator_id = ?`).bind(...values, nowIso(), upstreamId, operatorId).run(),
+      logger
+    );
   },
-  async listCustomerLinks(db, operatorId) {
-    return db.prepare("SELECT * FROM customer_links WHERE operator_id = ? ORDER BY created_at DESC").bind(operatorId).all();
+  async listCustomerLinks(db, operatorId, logger) {
+    return dbAll(db, "customer_links.list", () => db.prepare("SELECT * FROM customer_links WHERE operator_id = ? ORDER BY created_at DESC").bind(operatorId).all(), logger);
   },
-  async getCustomerLinkByToken(db, token) {
-    return db.prepare("SELECT * FROM customer_links WHERE public_token = ? AND enabled = 1 AND revoked_at IS NULL").bind(token).first();
+  async getCustomerLinkByToken(db, token, logger) {
+    return dbFirst(
+      db,
+      "customer_links.get_by_token",
+      () => db.prepare("SELECT * FROM customer_links WHERE public_token = ? AND enabled = 1 AND revoked_at IS NULL").bind(token).first(),
+      logger
+    );
   },
-  async getCustomerLinkById(db, operatorId, id) {
-    return db.prepare("SELECT * FROM customer_links WHERE id = ? AND operator_id = ?").bind(id, operatorId).first();
+  async getCustomerLinkById(db, operatorId, id, logger) {
+    return dbFirst(
+      db,
+      "customer_links.get_by_id",
+      () => db.prepare("SELECT * FROM customer_links WHERE id = ? AND operator_id = ?").bind(id, operatorId).first(),
+      logger
+    );
   },
-  async getPrimaryCustomerLink(db, operatorId) {
-    return db
-      .prepare("SELECT * FROM customer_links WHERE operator_id = ? AND enabled = 1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1")
-      .bind(operatorId)
-      .first();
+  async getPrimaryCustomerLink(db, operatorId, logger) {
+    return dbFirst(
+      db,
+      "customer_links.get_primary",
+      () =>
+        db
+          .prepare("SELECT * FROM customer_links WHERE operator_id = ? AND enabled = 1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1")
+          .bind(operatorId)
+          .first(),
+      logger
+    );
   },
-  async createCustomerLink(db, operatorId, label, overrides) {
+  async createCustomerLink(db, operatorId, label, overrides, logger) {
     const id = crypto.randomUUID();
     const token = crypto.randomUUID();
-    await db
-      .prepare(
-        "INSERT INTO customer_links (id, operator_id, public_token, label, enabled, overrides_json, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)"
-      )
-      .bind(id, operatorId, token, label || null, overrides ? JSON.stringify(overrides) : null, nowIso(), nowIso())
-      .run();
-    return this.getCustomerLinkById(db, operatorId, id);
+    await dbRun(
+      db,
+      "customer_links.create",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO customer_links (id, operator_id, public_token, label, enabled, overrides_json, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)"
+          )
+          .bind(id, operatorId, token, label || null, overrides ? JSON.stringify(overrides) : null, nowIso(), nowIso())
+          .run(),
+      logger
+    );
+    return this.getCustomerLinkById(db, operatorId, id, logger);
   },
-  async rotateCustomerLink(db, operatorId, id) {
+  async rotateCustomerLink(db, operatorId, id, logger) {
     const now = nowIso();
-    await db
-      .prepare("UPDATE customer_links SET enabled = 0, revoked_at = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
-      .bind(now, now, id, operatorId)
-      .run();
-    return this.createCustomerLink(db, operatorId, null, null);
+    await dbRun(
+      db,
+      "customer_links.rotate",
+      () =>
+        db
+          .prepare("UPDATE customer_links SET enabled = 0, revoked_at = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
+          .bind(now, now, id, operatorId)
+          .run(),
+      logger
+    );
+    return this.createCustomerLink(db, operatorId, null, null, logger);
   },
-  async updateCustomerLinkOverrides(db, operatorId, id, overrides) {
-    await db
-      .prepare("UPDATE customer_links SET overrides_json = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
-      .bind(overrides ? JSON.stringify(overrides) : null, nowIso(), id, operatorId)
-      .run();
+  async updateCustomerLinkOverrides(db, operatorId, id, overrides, logger) {
+    await dbRun(
+      db,
+      "customer_links.update_overrides",
+      () =>
+        db
+          .prepare("UPDATE customer_links SET overrides_json = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
+          .bind(overrides ? JSON.stringify(overrides) : null, nowIso(), id, operatorId)
+          .run(),
+      logger
+    );
   },
-  async upsertLastKnownGood(db, operatorId, token, bodyValue, bodyFormat, headersJson) {
-    await db
-      .prepare(
-        "INSERT INTO last_known_good (operator_id, public_token, body_value, body_format, headers_json, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(operator_id, public_token) DO UPDATE SET body_value = excluded.body_value, body_format = excluded.body_format, headers_json = excluded.headers_json, updated_at = excluded.updated_at"
-      )
-      .bind(operatorId, token, bodyValue, bodyFormat, headersJson, nowIso())
-      .run();
+  async upsertLastKnownGood(db, operatorId, token, bodyValue, bodyFormat, headersJson, logger) {
+    await dbRun(
+      db,
+      "last_known_good.upsert",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO last_known_good (operator_id, public_token, body_value, body_format, headers_json, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(operator_id, public_token) DO UPDATE SET body_value = excluded.body_value, body_format = excluded.body_format, headers_json = excluded.headers_json, updated_at = excluded.updated_at"
+          )
+          .bind(operatorId, token, bodyValue, bodyFormat, headersJson, nowIso())
+          .run(),
+      logger
+    );
   },
-  async getLastKnownGood(db, operatorId, token) {
-    return db.prepare("SELECT * FROM last_known_good WHERE operator_id = ? AND public_token = ?").bind(operatorId, token).first();
+  async getLastKnownGood(db, operatorId, token, logger) {
+    return dbFirst(
+      db,
+      "last_known_good.get",
+      () => db.prepare("SELECT * FROM last_known_good WHERE operator_id = ? AND public_token = ?").bind(operatorId, token).first(),
+      logger
+    );
   },
-  async upsertSnapshot(db, snapshot) {
-    await db
-      .prepare(
-        "INSERT INTO snapshots (token, operator_id, body_value, body_format, headers_json, updated_at, ttl_sec, quotas_json, notify_fetches, last_fetch_notify_at, channel_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(token) DO UPDATE SET body_value = excluded.body_value, body_format = excluded.body_format, headers_json = excluded.headers_json, updated_at = excluded.updated_at, ttl_sec = excluded.ttl_sec, operator_id = excluded.operator_id, quotas_json = excluded.quotas_json, notify_fetches = excluded.notify_fetches, last_fetch_notify_at = excluded.last_fetch_notify_at, channel_id = excluded.channel_id"
-      )
-      .bind(
-        snapshot.token,
-        snapshot.operator_id,
-        snapshot.body_value,
-        snapshot.body_format,
-        snapshot.headers_json,
-        snapshot.updated_at,
-        snapshot.ttl_sec,
-        snapshot.quotas_json || null,
-        snapshot.notify_fetches ?? APP.notifyFetchDefault,
-        snapshot.last_fetch_notify_at || null,
-        snapshot.channel_id || null
-      )
-      .run();
+  async upsertSnapshot(db, snapshot, logger) {
+    await dbRun(
+      db,
+      "snapshots.upsert",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO snapshots (token, operator_id, body_value, body_format, headers_json, updated_at, ttl_sec, quotas_json, notify_fetches, last_fetch_notify_at, channel_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(token) DO UPDATE SET body_value = excluded.body_value, body_format = excluded.body_format, headers_json = excluded.headers_json, updated_at = excluded.updated_at, ttl_sec = excluded.ttl_sec, operator_id = excluded.operator_id, quotas_json = excluded.quotas_json, notify_fetches = excluded.notify_fetches, last_fetch_notify_at = excluded.last_fetch_notify_at, channel_id = excluded.channel_id"
+          )
+          .bind(
+            snapshot.token,
+            snapshot.operator_id,
+            snapshot.body_value,
+            snapshot.body_format,
+            snapshot.headers_json,
+            snapshot.updated_at,
+            snapshot.ttl_sec,
+            snapshot.quotas_json || null,
+            snapshot.notify_fetches ?? APP.notifyFetchDefault,
+            snapshot.last_fetch_notify_at || null,
+            snapshot.channel_id || null
+          )
+          .run(),
+      logger
+    );
   },
-  async getSnapshot(db, token) {
-    return db.prepare("SELECT * FROM snapshots WHERE token = ?").bind(token).first();
+  async getSnapshot(db, token, logger) {
+    return dbFirst(db, "snapshots.get", () => db.prepare("SELECT * FROM snapshots WHERE token = ?").bind(token).first(), logger);
   },
-  async getLatestSnapshotInfo(db, operatorId) {
-    return db
-      .prepare("SELECT token, updated_at, ttl_sec FROM snapshots WHERE operator_id = ? ORDER BY updated_at DESC LIMIT 1")
-      .bind(operatorId)
-      .first();
+  async getLatestSnapshotInfo(db, operatorId, logger) {
+    return dbFirst(
+      db,
+      "snapshots.get_latest_info",
+      () =>
+        db
+          .prepare("SELECT token, updated_at, ttl_sec FROM snapshots WHERE operator_id = ? ORDER BY updated_at DESC LIMIT 1")
+          .bind(operatorId)
+          .first(),
+      logger
+    );
   },
-  async bumpUpstreamFailure(db, upstreamId, failureCount, cooldownUntil) {
-    await db
-      .prepare(
-        "UPDATE operator_upstreams SET failure_count = ?, cooldown_until = ?, last_failure_at = ? WHERE id = ?"
-      )
-      .bind(failureCount, cooldownUntil, nowIso(), upstreamId)
-      .run();
+  async bumpUpstreamFailure(db, upstreamId, failureCount, cooldownUntil, logger) {
+    await dbRun(
+      db,
+      "operator_upstreams.bump_failure",
+      () =>
+        db
+          .prepare("UPDATE operator_upstreams SET failure_count = ?, cooldown_until = ?, last_failure_at = ? WHERE id = ?")
+          .bind(failureCount, cooldownUntil, nowIso(), upstreamId)
+          .run(),
+      logger
+    );
   },
-  async clearUpstreamFailure(db, upstreamId) {
-    await db
-      .prepare(
-        "UPDATE operator_upstreams SET failure_count = 0, cooldown_until = NULL, last_success_at = ? WHERE id = ?"
-      )
-      .bind(nowIso(), upstreamId)
-      .run();
+  async clearUpstreamFailure(db, upstreamId, logger) {
+    await dbRun(
+      db,
+      "operator_upstreams.clear_failure",
+      () =>
+        db
+          .prepare("UPDATE operator_upstreams SET failure_count = 0, cooldown_until = NULL, last_success_at = ? WHERE id = ?")
+          .bind(nowIso(), upstreamId)
+          .run(),
+      logger
+    );
   },
-  async createNotifyJob(db, payload) {
-    await db
-      .prepare(
-        "INSERT INTO notify_jobs (id, operator_id, payload_json, status, attempts, available_at, created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?)"
-      )
-      .bind(crypto.randomUUID(), payload.operator_id || null, JSON.stringify(payload), Date.now(), nowIso(), nowIso())
-      .run();
+  async createNotifyJob(db, payload, logger) {
+    await dbRun(
+      db,
+      "notify_jobs.create",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO notify_jobs (id, operator_id, payload_json, status, attempts, available_at, created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?)"
+          )
+          .bind(crypto.randomUUID(), payload.operator_id || null, JSON.stringify(payload), Date.now(), nowIso(), nowIso())
+          .run(),
+      logger
+    );
   },
-  async listNotifyJobs(db, limit = 10) {
-    return db
-      .prepare("SELECT * FROM notify_jobs WHERE status = 'pending' AND available_at <= ? ORDER BY created_at ASC LIMIT ?")
-      .bind(Date.now(), limit)
-      .all();
+  async listNotifyJobs(db, limit = 10, logger) {
+    return dbAll(
+      db,
+      "notify_jobs.list_pending",
+      () =>
+        db
+          .prepare("SELECT * FROM notify_jobs WHERE status = 'pending' AND available_at <= ? ORDER BY created_at ASC LIMIT ?")
+          .bind(Date.now(), limit)
+          .all(),
+      logger
+    );
   },
-  async updateNotifyJob(db, id, patch) {
+  async updateNotifyJob(db, id, patch, logger) {
     const fields = Object.keys(patch);
     if (!fields.length) return;
     const setClause = fields.map((field) => `${field} = ?`).join(", ");
     const values = fields.map((field) => patch[field]);
-    await db.prepare(`UPDATE notify_jobs SET ${setClause}, updated_at = ? WHERE id = ?`).bind(...values, nowIso(), id).run();
+    await dbRun(
+      db,
+      "notify_jobs.update",
+      () => db.prepare(`UPDATE notify_jobs SET ${setClause}, updated_at = ? WHERE id = ?`).bind(...values, nowIso(), id).run(),
+      logger
+    );
   },
-  async purgeOldRecords(db, retentionMs) {
-    await db.prepare("DELETE FROM audit_logs WHERE created_at < ?").bind(new Date(Date.now() - retentionMs).toISOString()).run();
-    await db.prepare("DELETE FROM rate_limits WHERE updated_at < ?").bind(new Date(Date.now() - retentionMs).toISOString()).run();
-    await db.prepare("DELETE FROM notify_jobs WHERE created_at < ? AND status = 'done'").bind(new Date(Date.now() - retentionMs).toISOString()).run();
+  async purgeOldRecords(db, retentionMs, logger) {
+    await dbRun(
+      db,
+      "audit_logs.purge",
+      () => db.prepare("DELETE FROM audit_logs WHERE created_at < ?").bind(new Date(Date.now() - retentionMs).toISOString()).run(),
+      logger
+    );
+    await dbRun(
+      db,
+      "rate_limits.purge",
+      () => db.prepare("DELETE FROM rate_limits WHERE updated_at < ?").bind(new Date(Date.now() - retentionMs).toISOString()).run(),
+      logger
+    );
+    await dbRun(
+      db,
+      "notify_jobs.purge",
+      () => db.prepare("DELETE FROM notify_jobs WHERE created_at < ? AND status = 'done'").bind(new Date(Date.now() - retentionMs).toISOString()).run(),
+      logger
+    );
   },
-  async createApiKey(db, operatorId, keyHash, scopesJson) {
-    await db
-      .prepare("INSERT INTO api_keys (id, operator_id, key_hash, scopes_json, created_at) VALUES (?, ?, ?, ?, ?)")
-      .bind(crypto.randomUUID(), operatorId, keyHash, scopesJson || null, nowIso())
-      .run();
+  async createApiKey(db, operatorId, keyHash, scopesJson, logger) {
+    await dbRun(
+      db,
+      "api_keys.create",
+      () =>
+        db
+          .prepare("INSERT INTO api_keys (id, operator_id, key_hash, scopes_json, created_at) VALUES (?, ?, ?, ?, ?)")
+          .bind(crypto.randomUUID(), operatorId, keyHash, scopesJson || null, nowIso())
+          .run(),
+      logger
+    );
   },
-  async getApiKeyByHash(db, keyHash) {
-    return db.prepare("SELECT * FROM api_keys WHERE key_hash = ?").bind(keyHash).first();
+  async getApiKeyByHash(db, keyHash, logger) {
+    return dbFirst(db, "api_keys.get_by_hash", () => db.prepare("SELECT * FROM api_keys WHERE key_hash = ?").bind(keyHash).first(), logger);
   },
-  async touchApiKey(db, keyHash) {
-    await db.prepare("UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?").bind(nowIso(), keyHash).run();
+  async touchApiKey(db, keyHash, logger) {
+    await dbRun(db, "api_keys.touch", () => db.prepare("UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?").bind(nowIso(), keyHash).run(), logger);
   },
-  async createInviteCode(db, code, operatorId) {
-    await db
-      .prepare("INSERT INTO invite_codes (code, created_by, created_at) VALUES (?, ?, ?)")
-      .bind(code, operatorId, nowIso())
-      .run();
+  async createInviteCode(db, code, operatorId, logger) {
+    await dbRun(
+      db,
+      "invite_codes.create",
+      () => db.prepare("INSERT INTO invite_codes (code, created_by, created_at) VALUES (?, ?, ?)").bind(code, operatorId, nowIso()).run(),
+      logger
+    );
   },
-  async getInviteCode(db, code) {
-    return db.prepare("SELECT * FROM invite_codes WHERE code = ?").bind(code).first();
+  async getInviteCode(db, code, logger) {
+    return dbFirst(db, "invite_codes.get", () => db.prepare("SELECT * FROM invite_codes WHERE code = ?").bind(code).first(), logger);
   },
-  async useInviteCode(db, code, operatorId) {
-    await db
-      .prepare("UPDATE invite_codes SET used_by = ?, used_at = ? WHERE code = ? AND used_at IS NULL")
-      .bind(operatorId, nowIso(), code)
-      .run();
+  async useInviteCode(db, code, operatorId, logger) {
+    await dbRun(
+      db,
+      "invite_codes.use",
+      () => db.prepare("UPDATE invite_codes SET used_by = ?, used_at = ? WHERE code = ? AND used_at IS NULL").bind(operatorId, nowIso(), code).run(),
+      logger
+    );
   },
-  async logAudit(db, payload) {
+  async logAudit(db, payload, logger) {
     const id = crypto.randomUUID();
-    await db
-      .prepare(
-        "INSERT INTO audit_logs (id, operator_id, event_type, ip, country, user_agent, request_path, response_status, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      )
-      .bind(
-        id,
-        payload.operator_id || null,
-        payload.event_type,
-        payload.ip || null,
-        payload.country || null,
-        payload.user_agent || null,
-        payload.request_path || null,
-        payload.response_status || null,
-        payload.meta_json || null,
-        nowIso()
-      )
-      .run();
+    await dbRun(
+      db,
+      "audit_logs.create",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO audit_logs (id, operator_id, event_type, ip, country, user_agent, request_path, response_status, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          )
+          .bind(
+            id,
+            payload.operator_id || null,
+            payload.event_type,
+            payload.ip || null,
+            payload.country || null,
+            payload.user_agent || null,
+            payload.request_path || null,
+            payload.response_status || null,
+            payload.meta_json || null,
+            nowIso()
+          )
+          .run(),
+      logger
+    );
   },
-  async listAuditLogs(db, operatorId, limit = 5) {
-    return db.prepare("SELECT * FROM audit_logs WHERE operator_id = ? ORDER BY created_at DESC LIMIT ?").bind(operatorId, limit).all();
+  async listAuditLogs(db, operatorId, limit = 5, logger) {
+    return dbAll(
+      db,
+      "audit_logs.list",
+      () => db.prepare("SELECT * FROM audit_logs WHERE operator_id = ? ORDER BY created_at DESC LIMIT ?").bind(operatorId, limit).all(),
+      logger
+    );
   },
-  async bumpRateLimit(db, key, windowMs, max) {
+  async bumpRateLimit(db, key, windowMs, max, logger) {
     const now = Date.now();
-    const existing = await db.prepare("SELECT * FROM rate_limits WHERE key = ?").bind(key).first();
+    const existing = await dbFirst(db, "rate_limits.get", () => db.prepare("SELECT * FROM rate_limits WHERE key = ?").bind(key).first(), logger);
     if (!existing || now - existing.window_start > windowMs) {
-      await db
-        .prepare(
-          "INSERT INTO rate_limits (key, count, window_start, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET count = excluded.count, window_start = excluded.window_start, updated_at = excluded.updated_at"
-        )
-        .bind(key, 1, now, nowIso())
-        .run();
+      await dbRun(
+        db,
+        "rate_limits.upsert",
+        () =>
+          db
+            .prepare(
+              "INSERT INTO rate_limits (key, count, window_start, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET count = excluded.count, window_start = excluded.window_start, updated_at = excluded.updated_at"
+            )
+            .bind(key, 1, now, nowIso())
+            .run(),
+        logger
+      );
       return true;
     }
     const nextCount = existing.count + 1;
-    await db.prepare("UPDATE rate_limits SET count = ?, updated_at = ? WHERE key = ?").bind(nextCount, nowIso(), key).run();
+    await dbRun(
+      db,
+      "rate_limits.update",
+      () => db.prepare("UPDATE rate_limits SET count = ?, updated_at = ? WHERE key = ?").bind(nextCount, nowIso(), key).run(),
+      logger
+    );
     return nextCount <= max;
   },
 };
@@ -870,22 +1443,29 @@ const D1 = {
 // Domain Services
 // =============================
 const OperatorService = {
-  async ensureOperator(db, telegramUser, env) {
-    let operator = await D1.getOperatorByTelegramId(db, telegramUser.id);
+  async ensureOperator(db, telegramUser, env, logger) {
+    let operator = await D1.getOperatorByTelegramId(db, telegramUser.id, logger);
     if (!operator && isAdmin(telegramUser.id, env)) {
-      operator = await D1.createOperator(db, telegramUser.id, telegramUser.first_name || telegramUser.username, "admin", "active");
+      operator = await D1.createOperator(
+        db,
+        telegramUser.id,
+        telegramUser.first_name || telegramUser.username,
+        "admin",
+        "active",
+        logger
+      );
     }
     if (!operator) return null;
     if (operator.status !== "active") return operator;
-    await D1.touchOperator(db, operator.id);
+    await D1.touchOperator(db, operator.id, logger);
     return operator;
   },
-  async getShareLink(db, operator, baseUrl) {
-    const settings = await D1.getSettings(db, operator.id);
-    const share = await D1.getPrimaryCustomerLink(db, operator.id);
+  async getShareLink(db, operator, baseUrl, logger) {
+    const settings = await D1.getSettings(db, operator.id, logger);
+    const share = await D1.getPrimaryCustomerLink(db, operator.id, logger);
     let hostBase = baseUrl;
     if (settings?.active_domain_id) {
-      const domain = await D1.getDomainById(db, settings.active_domain_id);
+      const domain = await D1.getDomainById(db, settings.active_domain_id, logger);
       if (domain?.domain) hostBase = `https://${domain.domain}`;
     }
     return `${hostBase.replace(/\/$/, "")}/sub/${share?.public_token || ""}`;
@@ -893,27 +1473,35 @@ const OperatorService = {
 };
 
 const SubscriptionAssembler = {
-  async assemble(env, db, operatorId, token, request, requestId, customerLink, preloaded = {}) {
-    const settings = preloaded.settings || (await D1.getSettings(db, operatorId));
-    const baseRules = preloaded.rules || (await D1.getRules(db, operatorId));
-    const overrides = safeParseJson(customerLink?.overrides_json, {});
+  async assemble(env, db, operatorId, token, request, requestId, customerLink, preloaded = {}, logger) {
+    const span = (logger || Logger).span("subscription_assemble", { operator_id: operatorId });
+    try {
+      const settings = preloaded.settings || (await D1.getSettings(db, operatorId, logger));
+      const baseRules = preloaded.rules || (await D1.getRules(db, operatorId, logger));
+      const overrides = safeJsonParse(customerLink?.overrides_json, {}, logger, {
+        error_code: "E_JSON_PARSE",
+        operator_id: operatorId,
+        context: "customer_link_overrides",
+      });
     const rules = { ...baseRules, ...overrides };
-    const extras = preloaded.extras || (await D1.listEnabledExtras(db, operatorId));
+    const extras = preloaded.extras || (await D1.listEnabledExtras(db, operatorId, logger));
     const selectedExtras = overrides?.extras?.length
       ? (extras?.results || []).filter((item) => overrides.extras.includes(item.id))
       : (extras?.results || []);
 
-    const upstreams = preloaded.upstreams || (await D1.listUpstreams(db, operatorId));
+    const upstreams = preloaded.upstreams || (await D1.listUpstreams(db, operatorId, logger));
     const allowlist = parseCommaList(settings?.upstream_allowlist);
     const denylist = parseCommaList(settings?.upstream_denylist);
 
-    const upstreamPayloads = await this.fetchUpstreams(env, db, upstreams?.results || [], allowlist, denylist);
-    const selected = this.selectUpstreamsByPolicy(upstreamPayloads, rules?.merge_policy || "append");
+    const upstreamPayloads = await this.fetchUpstreams(env, db, upstreams?.results || [], allowlist, denylist, logger);
+    const selected = this.selectUpstreamsByPolicy(upstreamPayloads, rules?.merge_policy || "append", logger);
     const extrasContent = selectedExtras.map((item) => item.content).join("\n");
 
     if (!selected.ok) {
-      await D1.updateSettings(db, operatorId, { last_upstream_status: "invalid", last_upstream_at: nowIso() });
-      await D1.logAudit(db, {
+      await D1.updateSettings(db, operatorId, { last_upstream_status: "invalid", last_upstream_at: nowIso() }, logger);
+      await D1.logAudit(
+        db,
+        {
         operator_id: operatorId,
         event_type: "upstream_invalid",
         ip: request.headers.get("cf-connecting-ip"),
@@ -922,29 +1510,43 @@ const SubscriptionAssembler = {
         request_path: new URL(request.url).pathname,
         response_status: 502,
         meta_json: JSON.stringify({ reason: "upstream_invalid", request_id: requestId }),
+        },
+        logger
+      );
+      await AuditService.notifyOperator(env, settings, `⚠️ آپ‌استریم نامعتبر بود برای <b>${safeHtml(settings?.branding || "اپراتور")}</b>`, logger);
+      (logger || Logger).warn("upstream_invalid", {
+        error_code: "E_UPSTREAM_INVALID",
+        reason: ERROR_CODES.E_UPSTREAM_INVALID.reason,
+        hints: ERROR_CODES.E_UPSTREAM_INVALID.hints,
+        operator_id: operatorId,
       });
-      await AuditService.notifyOperator(env, settings, `⚠️ آپ‌استریم نامعتبر بود برای <b>${safeHtml(settings?.branding || "اپراتور")}</b>`);
       return { body: "", headers: { ...DEFAULT_HEADERS, "x-sub-status": "upstream_invalid" }, valid: false };
     }
 
-    await D1.updateSettings(db, operatorId, { last_upstream_status: "ok", last_upstream_at: nowIso() });
+    await D1.updateSettings(db, operatorId, { last_upstream_status: "ok", last_upstream_at: nowIso() }, logger);
 
     const merged = this.mergeContent(selected.text, extrasContent, rules);
-    const processed = this.applyRules(merged, rules);
+    const processed = this.applyRules(merged, rules, logger);
     const limited = limitOutput(processed.split("\n"), rules?.limit_lines || APP.maxOutputLines, rules?.limit_bytes || APP.maxOutputBytes);
     const outputBody = limited.join("\n");
     const formatted = rules?.output_format === "plain" ? outputBody : utf8SafeEncode(outputBody);
 
-    return {
+      span.end({ operator_id: operatorId, output_bytes: outputBody.length });
+      return {
       body: formatted,
       headers: {
         ...DEFAULT_HEADERS,
         ...(selected.subscriptionUserinfo ? { "subscription-userinfo": selected.subscriptionUserinfo } : {}),
       },
       valid: true,
-    };
+      };
+    } catch (err) {
+      span.fail(err, { operator_id: operatorId, error_code: "E_INTERNAL", reason: ERROR_CODES.E_INTERNAL.reason });
+      throw err;
+    }
   },
-  async fetchUpstreams(env, db, upstreams, allowlist, denylist) {
+  async fetchUpstreams(env, db, upstreams, allowlist, denylist, logger) {
+    const span = (logger || Logger).span("upstreams_fetch", { upstream_count: upstreams.length });
     const now = Date.now();
     const results = await mapWithConcurrency(upstreams, APP.upstreamMaxConcurrency, async (upstream) => {
       const cooldownUntil = upstream.cooldown_until ? Date.parse(upstream.cooldown_until) : 0;
@@ -954,17 +1556,30 @@ const SubscriptionAssembler = {
       const decryptedUrl = await decryptUpstreamUrl(env, upstream.url);
       const validation = assertSafeUpstream(decryptedUrl, allowlist, denylist);
       if (!validation.ok) {
+        (logger || Logger).warn("upstream_blocked", {
+          error_code: "E_SSRF_BLOCKED",
+          reason: ERROR_CODES.E_SSRF_BLOCKED.reason,
+          hints: ERROR_CODES.E_SSRF_BLOCKED.hints,
+          upstream: redactUrlForLog(decryptedUrl),
+          blocked_reason: validation.error,
+        });
         return { ok: false, status: 400, body: "", subscriptionUserinfo: null, isBase64: false, error: validation.error, upstream };
       }
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), APP.upstreamTimeoutMs);
       try {
-        const headers = upstream.headers_json ? JSON.parse(upstream.headers_json) : { "user-agent": "v2rayNG" };
+        const headers = upstream.headers_json
+          ? safeJsonParse(upstream.headers_json, { "user-agent": "v2rayNG" }, logger, {
+              error_code: "E_JSON_PARSE",
+              context: "upstream_headers",
+            })
+          : { "user-agent": "v2rayNG" };
         const res = await fetchWithRedirects(
           decryptedUrl,
           { cf: { cacheTtl: 0 }, signal: controller.signal, headers },
           APP.maxRedirects,
-          (nextUrl) => assertSafeUpstream(nextUrl, allowlist, denylist)
+          (nextUrl) => assertSafeUpstream(nextUrl, allowlist, denylist),
+          logger
         );
         const text = await res.text();
         if (new TextEncoder().encode(text).length > APP.maxOutputBytes) {
@@ -972,11 +1587,11 @@ const SubscriptionAssembler = {
         }
         clearTimeout(timeout);
         if (res.ok) {
-          await D1.clearUpstreamFailure(db, upstream.id);
+          await D1.clearUpstreamFailure(db, upstream.id, logger);
         } else {
           const nextFailure = Math.min(APP.upstreamFailureThreshold, (upstream.failure_count || 0) + 1);
           const cooldown = nextFailure >= APP.upstreamFailureThreshold ? new Date(Date.now() + APP.upstreamCooldownMs).toISOString() : null;
-          await D1.bumpUpstreamFailure(db, upstream.id, nextFailure, cooldown);
+          await D1.bumpUpstreamFailure(db, upstream.id, nextFailure, cooldown, logger);
         }
         return {
           ok: res.ok,
@@ -988,18 +1603,32 @@ const SubscriptionAssembler = {
         };
       } catch (err) {
         clearTimeout(timeout);
-        Logger.warn("Upstream fetch failed", { error: err?.message, upstream: redactUrlForLog(decryptedUrl) });
+        (logger || Logger).error("upstream_fetch_failed", err, {
+          error_code: "E_UPSTREAM_FETCH",
+          reason: ERROR_CODES.E_UPSTREAM_FETCH.reason,
+          hints: ERROR_CODES.E_UPSTREAM_FETCH.hints,
+          upstream: redactUrlForLog(decryptedUrl),
+        });
         const nextFailure = Math.min(APP.upstreamFailureThreshold, (upstream.failure_count || 0) + 1);
         const cooldown = nextFailure >= APP.upstreamFailureThreshold ? new Date(Date.now() + APP.upstreamCooldownMs).toISOString() : null;
-        await D1.bumpUpstreamFailure(db, upstream.id, nextFailure, cooldown);
+        await D1.bumpUpstreamFailure(db, upstream.id, nextFailure, cooldown, logger);
         return { ok: false, status: 502, body: "", subscriptionUserinfo: null, isBase64: false, error: "fetch_failed", upstream };
       }
     });
+    span.end({ upstream_ok: results.filter((item) => item.ok).length });
     return results;
   },
-  selectUpstreamsByPolicy(results, policy) {
+  selectUpstreamsByPolicy(results, policy, logger) {
+    (logger || Logger).info("upstream_select_policy", { policy, candidates: results.length });
     const valid = results.filter((item) => item.ok && isValidSubscriptionText(this.decodeSubscription(item.body, item.isBase64)));
-    if (!valid.length) return { ok: false, text: "", subscriptionUserinfo: null };
+    if (!valid.length) {
+      (logger || Logger).warn("upstream_selection_empty", {
+        error_code: "E_UPSTREAM_INVALID",
+        reason: ERROR_CODES.E_UPSTREAM_INVALID.reason,
+        hints: ERROR_CODES.E_UPSTREAM_INVALID.hints,
+      });
+      return { ok: false, text: "", subscriptionUserinfo: null };
+    }
     if (policy === "upstream_only") {
       const first = valid[0];
       return { ok: true, text: this.decodeSubscription(first.body, first.isBase64), subscriptionUserinfo: first.subscriptionUserinfo };
@@ -1054,7 +1683,12 @@ const SubscriptionAssembler = {
     if (policy === "replace") return extras || "";
     return [upstream, extras].filter(Boolean).join("\n");
   },
-  applyRules(content, rules) {
+  applyRules(content, rules, logger) {
+    (logger || Logger).debug("apply_rules_start", {
+      sanitize: rules?.sanitize,
+      dedupe: rules?.dedupe,
+      naming_mode: rules?.naming_mode,
+    });
     const lines = content
       .split("\n")
       .map((line) => line.trim())
@@ -1069,113 +1703,190 @@ const SubscriptionAssembler = {
     if (rules?.naming_mode === "prefix" && rules?.naming_prefix) {
       processed = processed.map((line) => `${rules.naming_prefix}${line}`);
     }
+    (logger || Logger).debug("apply_rules_end", { output_lines: processed.length });
     return processed.join("\n");
   },
 };
 
 const NotificationService = {
-  async enqueue(env, payload) {
+  async enqueue(env, payload, logger) {
     if (!payload?.messageHtml) return;
     if (env.NOTIFY_QUEUE) {
       await env.NOTIFY_QUEUE.send(payload);
       return;
     }
-    await D1.createNotifyJob(env.DB, payload);
+    await D1.createNotifyJob(env.DB, payload, logger);
   },
-  async sendWithBackoff(env, payload, attempt = 0) {
+  async sendWithBackoff(env, payload, attempt = 0, logger) {
     const channelId = payload?.channel_id || env.LOG_CHANNEL_ID;
     if (!channelId || !env.TELEGRAM_TOKEN) return false;
     const maxAttempts = 4;
     for (let i = attempt; i < maxAttempts; i += 1) {
       try {
-        const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: channelId,
-            text: payload.messageHtml,
-            parse_mode: "HTML",
-            disable_web_page_preview: true,
-          }),
-        });
+        const res = await fetchWithLogs(
+          `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: channelId,
+              text: payload.messageHtml,
+              parse_mode: "HTML",
+              disable_web_page_preview: true,
+            }),
+          },
+          { label: "telegram_send_message", error_code: "E_TELEGRAM_API" },
+          logger
+        );
         if (res.ok) return true;
+        (logger || Logger).warn("telegram_notify_non_ok", {
+          status: res.status,
+          error_code: "E_TELEGRAM_API",
+          reason: ERROR_CODES.E_TELEGRAM_API.reason,
+          hints: ERROR_CODES.E_TELEGRAM_API.hints,
+        });
       } catch (err) {
-        Logger.warn("Notify Telegram failed", { error: err?.message });
+        (logger || Logger).error("telegram_notify_failed", err, {
+          error_code: "E_TELEGRAM_API",
+          reason: ERROR_CODES.E_TELEGRAM_API.reason,
+          hints: ERROR_CODES.E_TELEGRAM_API.hints,
+        });
       }
       const delayMs = Math.min(30_000, 1000 * 2 ** i);
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     return false;
   },
-  async processQueueMessage(env, message) {
-    const ok = await this.sendWithBackoff(env, message?.body || message);
+  async processQueueMessage(env, message, logger) {
+    const ok = await this.sendWithBackoff(env, message?.body || message, 0, logger);
     if (!ok) throw new Error("notify_failed");
   },
-  async processPendingJobs(env) {
-    const jobs = await D1.listNotifyJobs(env.DB, 20);
+  async processPendingJobs(env, logger) {
+    const jobs = await D1.listNotifyJobs(env.DB, 20, logger);
     for (const job of jobs?.results || []) {
-      const payload = safeParseJson(job.payload_json, null);
-      const ok = await this.sendWithBackoff(env, payload, job.attempts || 0);
+      const payload = safeJsonParse(job.payload_json, null, logger, { error_code: "E_JSON_PARSE", context: "notify_job_payload" });
+      const ok = await this.sendWithBackoff(env, payload, job.attempts || 0, logger);
       if (ok) {
-        await D1.updateNotifyJob(env.DB, job.id, { status: "done" });
+        await D1.updateNotifyJob(env.DB, job.id, { status: "done" }, logger);
       } else {
         const nextAttempts = (job.attempts || 0) + 1;
         const delayMs = Math.min(60_000, 1000 * 2 ** nextAttempts);
-        await D1.updateNotifyJob(env.DB, job.id, {
-          attempts: nextAttempts,
-          available_at: Date.now() + delayMs,
-          status: "pending",
-        });
+        await D1.updateNotifyJob(
+          env.DB,
+          job.id,
+          {
+            attempts: nextAttempts,
+            available_at: Date.now() + delayMs,
+            status: "pending",
+          },
+          logger
+        );
       }
     }
   },
 };
 
 const AuditService = {
-  async notifyOperator(env, settings, messageHtml) {
-    await NotificationService.enqueue(env, {
-      operator_id: settings?.operator_id,
-      channel_id: settings?.channel_id,
-      messageHtml,
-    });
+  async notifyOperator(env, settings, messageHtml, logger) {
+    await NotificationService.enqueue(
+      env,
+      {
+        operator_id: settings?.operator_id,
+        channel_id: settings?.channel_id,
+        messageHtml,
+      },
+      logger
+    );
   },
 };
 
 const AuthService = {
-  async getAuthContext(request, env, db) {
+  async getAuthContext(request, env, db, logger) {
     const authHeader = request.headers.get("authorization") || "";
     if (authHeader.startsWith("Bearer ")) {
       const token = authHeader.replace("Bearer ", "").trim();
-      if (!token || !env.SESSION_SECRET) return null;
+      if (!token || !env.SESSION_SECRET) {
+        (logger || Logger).warn("auth_missing_token", {
+          error_code: "E_AUTH_UNAUTHORIZED",
+          reason: ERROR_CODES.E_AUTH_UNAUTHORIZED.reason,
+          hints: ERROR_CODES.E_AUTH_UNAUTHORIZED.hints,
+        });
+        return null;
+      }
       const payload = await verifySession(token, env.SESSION_SECRET);
-      if (!payload || payload.exp < Math.floor(Date.now() / 1000)) return null;
-      const operator = await D1.getOperatorById(db, payload.sub);
-      if (!operator || operator.status !== "active") return null;
+      if (!payload || payload.exp < Math.floor(Date.now() / 1000)) {
+        (logger || Logger).warn("auth_session_invalid", {
+          error_code: "E_AUTH_UNAUTHORIZED",
+          reason: ERROR_CODES.E_AUTH_UNAUTHORIZED.reason,
+          hints: ERROR_CODES.E_AUTH_UNAUTHORIZED.hints,
+        });
+        return null;
+      }
+      const operator = await D1.getOperatorById(db, payload.sub, logger);
+      if (!operator || operator.status !== "active") {
+        (logger || Logger).warn("auth_operator_inactive", {
+          error_code: "E_AUTH_FORBIDDEN",
+          reason: ERROR_CODES.E_AUTH_FORBIDDEN.reason,
+          hints: ERROR_CODES.E_AUTH_FORBIDDEN.hints,
+          operator_id: payload.sub,
+        });
+        return null;
+      }
+      const tokenHash = await hashApiKey(token);
+      (logger || Logger).info("auth_session_ok", {
+        operator_id: operator.id,
+        token_prefix: token.slice(0, 6),
+        token_hash: tokenHash.slice(0, 16),
+      });
       return { operator, tokenType: "session" };
     }
     const apiKey = request.headers.get("x-api-key");
     if (apiKey) {
       const hash = await hashApiKey(apiKey);
-      const key = await D1.getApiKeyByHash(db, hash);
-      if (!key) return null;
-      const operator = await D1.getOperatorById(db, key.operator_id);
-      if (!operator || operator.status !== "active") return null;
-      await D1.touchApiKey(db, hash);
+      const key = await D1.getApiKeyByHash(db, hash, logger);
+      if (!key) {
+        (logger || Logger).warn("auth_api_key_invalid", {
+          error_code: "E_AUTH_UNAUTHORIZED",
+          reason: ERROR_CODES.E_AUTH_UNAUTHORIZED.reason,
+          hints: ERROR_CODES.E_AUTH_UNAUTHORIZED.hints,
+        });
+        return null;
+      }
+      const operator = await D1.getOperatorById(db, key.operator_id, logger);
+      if (!operator || operator.status !== "active") {
+        (logger || Logger).warn("auth_api_key_forbidden", {
+          error_code: "E_AUTH_FORBIDDEN",
+          reason: ERROR_CODES.E_AUTH_FORBIDDEN.reason,
+          hints: ERROR_CODES.E_AUTH_FORBIDDEN.hints,
+          operator_id: key.operator_id,
+        });
+        return null;
+      }
+      await D1.touchApiKey(db, hash, logger);
+      (logger || Logger).info("auth_api_key_ok", {
+        operator_id: operator.id,
+        token_hash: hash.slice(0, 16),
+      });
       return { operator, tokenType: "api_key" };
     }
+    (logger || Logger).warn("auth_missing", {
+      error_code: "E_AUTH_UNAUTHORIZED",
+      reason: ERROR_CODES.E_AUTH_UNAUTHORIZED.reason,
+      hints: ERROR_CODES.E_AUTH_UNAUTHORIZED.hints,
+    });
     return null;
   },
 };
 
 const SnapshotService = {
-  async getSnapshot(env, token) {
+  async getSnapshot(env, token, logger) {
     if (env.SNAP_KV) {
       const entry = await env.SNAP_KV.get(token, "json");
       return entry;
     }
-    return D1.getSnapshot(env.DB, token);
+    return D1.getSnapshot(env.DB, token, logger);
   },
-  async setSnapshot(env, snapshot) {
+  async setSnapshot(env, snapshot, logger) {
     const payload = {
       token: snapshot.token,
       operator_id: snapshot.operator_id,
@@ -1192,20 +1903,20 @@ const SnapshotService = {
     if (env.SNAP_KV) {
       await env.SNAP_KV.put(snapshot.token, JSON.stringify(payload), { expirationTtl: snapshot.ttl_sec });
     }
-    await D1.upsertSnapshot(env.DB, snapshot);
+    await D1.upsertSnapshot(env.DB, snapshot, logger);
   },
-  async getLastKnownGood(env, operatorId, token) {
-    return D1.getLastKnownGood(env.DB, operatorId, token);
+  async getLastKnownGood(env, operatorId, token, logger) {
+    return D1.getLastKnownGood(env.DB, operatorId, token, logger);
   },
 };
 
-const buildSnapshotHeaders = (snapshot, requestId) => {
-  let headers = DEFAULT_HEADERS;
-  try {
-    headers = snapshot.headers_json ? JSON.parse(snapshot.headers_json) : DEFAULT_HEADERS;
-  } catch {
-    headers = DEFAULT_HEADERS;
-  }
+const buildSnapshotHeaders = (snapshot, requestId, logger) => {
+  const headers = snapshot.headers_json
+    ? safeJsonParse(snapshot.headers_json, DEFAULT_HEADERS, logger, {
+        error_code: "E_JSON_PARSE",
+        context: "snapshot_headers",
+      })
+    : DEFAULT_HEADERS;
   return {
     ...headers,
     "content-disposition": headers["content-disposition"] || `inline; filename=sub_${snapshot.token}.txt`,
@@ -1214,28 +1925,39 @@ const buildSnapshotHeaders = (snapshot, requestId) => {
   };
 };
 
-const buildSnapshotResponse = (snapshot, requestId) => {
-  const headers = buildSnapshotHeaders(snapshot, requestId);
+const buildSnapshotResponse = (snapshot, requestId, logger) => {
+  const headers = buildSnapshotHeaders(snapshot, requestId, logger);
   return new Response(snapshot.body_value || "", { headers });
 };
 
-const refreshSnapshot = async (env, token, request, requestId) => {
+const refreshSnapshot = async (env, token, request, requestId, logger) => {
   const db = env.DB;
-  const link = await D1.getCustomerLinkByToken(db, token);
+  const link = await D1.getCustomerLinkByToken(db, token, logger);
   if (!link) return;
   const operatorId = link.operator_id;
+  const scopedLogger = (logger || Logger).child({ operator_id: operatorId });
   const [settings, rules, extras, upstreams] = await Promise.all([
-    D1.getSettings(db, operatorId),
-    D1.getRules(db, operatorId),
-    D1.listEnabledExtras(db, operatorId),
-    D1.listUpstreams(db, operatorId),
+    D1.getSettings(db, operatorId, scopedLogger),
+    D1.getRules(db, operatorId, scopedLogger),
+    D1.listEnabledExtras(db, operatorId, scopedLogger),
+    D1.listUpstreams(db, operatorId, scopedLogger),
   ]);
-  const assembled = await SubscriptionAssembler.assemble(env, db, operatorId, token, request, requestId, link, {
-    settings,
-    rules,
-    extras,
-    upstreams,
-  });
+  const assembled = await SubscriptionAssembler.assemble(
+    env,
+    db,
+    operatorId,
+    token,
+    request,
+    requestId,
+    link,
+    {
+      settings,
+      rules,
+      extras,
+      upstreams,
+    },
+    scopedLogger
+  );
   const responseHeadersBase = { ...assembled.headers, "content-disposition": `inline; filename=sub_${token}.txt` };
   const bodyFormat = rules?.output_format === "plain" ? "plain" : "base64";
   if (assembled.valid) {
@@ -1254,8 +1976,8 @@ const refreshSnapshot = async (env, token, request, requestId) => {
     };
     setCachedSub(`sub:${token}`, assembled.body, responseHeadersBase, { snapshot });
     setLastGoodMem(`sub:${token}`, assembled.body, responseHeadersBase, { body_format: bodyFormat });
-    await SnapshotService.setSnapshot(env, snapshot);
-    await D1.upsertLastKnownGood(db, operatorId, token, assembled.body, bodyFormat, JSON.stringify(responseHeadersBase));
+    await SnapshotService.setSnapshot(env, snapshot, scopedLogger);
+    await D1.upsertLastKnownGood(db, operatorId, token, assembled.body, bodyFormat, JSON.stringify(responseHeadersBase), scopedLogger);
     const cacheUrl = new URL(`https://cache.internal/snap/${token}`);
     const cacheHeaders = {
       ...responseHeadersBase,
@@ -1270,28 +1992,41 @@ const refreshSnapshot = async (env, token, request, requestId) => {
       "x-snapshot-channel": snapshot.channel_id || "",
     };
     await caches.default.put(cacheUrl, new Response(assembled.body, { headers: cacheHeaders, status: 200 }));
-    await D1.logAudit(db, {
-      operator_id: operatorId,
-      event_type: "snapshot_refresh_ok",
-      ip: request.headers.get("cf-connecting-ip"),
-      country: request.headers.get("cf-ipcountry"),
-      user_agent: request.headers.get("user-agent"),
-      request_path: new URL(request.url).pathname,
-      response_status: 200,
-      meta_json: JSON.stringify({ request_id: requestId }),
-    });
+    await D1.logAudit(
+      db,
+      {
+        operator_id: operatorId,
+        event_type: "snapshot_refresh_ok",
+        ip: request.headers.get("cf-connecting-ip"),
+        country: request.headers.get("cf-ipcountry"),
+        user_agent: request.headers.get("user-agent"),
+        request_path: new URL(request.url).pathname,
+        response_status: 200,
+        meta_json: JSON.stringify({ request_id: requestId }),
+      },
+      scopedLogger
+    );
   } else {
-    await D1.logAudit(db, {
-      operator_id: operatorId,
-      event_type: "snapshot_refresh_failed",
-      ip: request.headers.get("cf-connecting-ip"),
-      country: request.headers.get("cf-ipcountry"),
-      user_agent: request.headers.get("user-agent"),
-      request_path: new URL(request.url).pathname,
-      response_status: 502,
-      meta_json: JSON.stringify({ request_id: requestId }),
-    });
-    await AuditService.notifyOperator(env, settings, `⚠️ بروزرسانی اسنپ‌شات ناموفق بود برای <b>${safeHtml(settings?.branding || "اپراتور")}</b>.`);
+    await D1.logAudit(
+      db,
+      {
+        operator_id: operatorId,
+        event_type: "snapshot_refresh_failed",
+        ip: request.headers.get("cf-connecting-ip"),
+        country: request.headers.get("cf-ipcountry"),
+        user_agent: request.headers.get("user-agent"),
+        request_path: new URL(request.url).pathname,
+        response_status: 502,
+        meta_json: JSON.stringify({ request_id: requestId }),
+      },
+      scopedLogger
+    );
+    await AuditService.notifyOperator(
+      env,
+      settings,
+      `⚠️ بروزرسانی اسنپ‌شات ناموفق بود برای <b>${safeHtml(settings?.branding || "اپراتور")}</b>.`,
+      scopedLogger
+    );
   }
 };
 
@@ -1299,175 +2034,285 @@ const refreshSnapshot = async (env, token, request, requestId) => {
 // Telegram Adapter
 // =============================
 const Telegram = {
-  async handleWebhook(request, env) {
+  async handleWebhook(request, env, logger) {
+    const span = (logger || Logger).span("telegram_webhook");
     if (env.TELEGRAM_SECRET) {
       const secret = request.headers.get("x-telegram-bot-api-secret-token");
-      if (secret !== env.TELEGRAM_SECRET) return new Response("unauthorized", { status: 401 });
+      if (secret !== env.TELEGRAM_SECRET) {
+        (logger || Logger).warn("telegram_webhook_secret_mismatch", {
+          error_code: "E_AUTH_UNAUTHORIZED",
+          reason: ERROR_CODES.E_AUTH_UNAUTHORIZED.reason,
+          hints: ERROR_CODES.E_AUTH_UNAUTHORIZED.hints,
+        });
+        span.end({ status: 401 });
+        return new Response("unauthorized", { status: 401 });
+      }
     }
     if (!request.headers.get("content-type")?.includes("application/json")) {
+      (logger || Logger).warn("telegram_webhook_unsupported", {
+        error_code: "E_INPUT_INVALID",
+        reason: ERROR_CODES.E_INPUT_INVALID.reason,
+        hints: ERROR_CODES.E_INPUT_INVALID.hints,
+      });
+      span.end({ status: 415 });
       return new Response("unsupported", { status: 415 });
     }
     const contentLength = Number(request.headers.get("content-length") || 0);
     if (contentLength && contentLength > APP.maxWebhookBytes) {
+      (logger || Logger).warn("telegram_webhook_too_large", {
+        error_code: "E_INPUT_INVALID",
+        reason: ERROR_CODES.E_INPUT_INVALID.reason,
+        hints: ERROR_CODES.E_INPUT_INVALID.hints,
+        content_length: contentLength,
+      });
+      span.end({ status: 413 });
       return new Response("payload too large", { status: 413 });
     }
 
     const ip = request.headers.get("cf-connecting-ip") || "unknown";
     if (!rateLimit(`tg:${ip}`)) {
-      const ok = await D1.bumpRateLimit(env.DB, `tg:${ip}`, APP.rateLimitWindowMs, APP.rateLimitMax * 2);
-      if (!ok) return new Response("rate limit", { status: 429 });
+      const ok = await D1.bumpRateLimit(env.DB, `tg:${ip}`, APP.rateLimitWindowMs, APP.rateLimitMax * 2, logger);
+      if (!ok) {
+        (logger || Logger).warn("telegram_rate_limited_ip", {
+          error_code: "E_RATE_LIMIT",
+          reason: ERROR_CODES.E_RATE_LIMIT.reason,
+          hints: ERROR_CODES.E_RATE_LIMIT.hints,
+          ip,
+        });
+        span.end({ status: 429 });
+        return new Response("rate limit", { status: 429 });
+      }
     }
 
     const bodyBuf = await request.arrayBuffer();
     if (bodyBuf.byteLength > APP.maxWebhookBytes) {
+      (logger || Logger).warn("telegram_webhook_too_large", {
+        error_code: "E_INPUT_INVALID",
+        reason: ERROR_CODES.E_INPUT_INVALID.reason,
+        hints: ERROR_CODES.E_INPUT_INVALID.hints,
+        content_length: bodyBuf.byteLength,
+      });
+      span.end({ status: 413 });
       return new Response("payload too large", { status: 413 });
     }
-    const update = JSON.parse(new TextDecoder().decode(bodyBuf));
+    const update = safeJsonParse(new TextDecoder().decode(bodyBuf), null, logger, {
+      error_code: "E_JSON_PARSE",
+      context: "telegram_webhook_payload",
+    });
+    if (!update) {
+      (logger || Logger).warn("telegram_webhook_invalid_json", {
+        error_code: "E_JSON_PARSE",
+        reason: ERROR_CODES.E_JSON_PARSE.reason,
+        hints: ERROR_CODES.E_JSON_PARSE.hints,
+      });
+      span.end({ status: 400 });
+      return new Response("invalid", { status: 400 });
+    }
     const message = update.message || update.callback_query?.message;
     const user = update.message?.from || update.callback_query?.from;
-    if (!user) return new Response("ok");
-    if (!rateLimit(`tg-user:${user.id}`)) return new Response("rate limit", { status: 429 });
+    if (!user) {
+      span.end({ status: 200 });
+      return new Response("ok");
+    }
+    if (!rateLimit(`tg-user:${user.id}`)) {
+      (logger || Logger).warn("telegram_rate_limited_user", {
+        error_code: "E_RATE_LIMIT",
+        reason: ERROR_CODES.E_RATE_LIMIT.reason,
+        hints: ERROR_CODES.E_RATE_LIMIT.hints,
+        telegram_user_id: user.id,
+      });
+      span.end({ status: 429 });
+      return new Response("rate limit", { status: 429 });
+    }
 
     const db = env.DB;
-    const operator = await OperatorService.ensureOperator(db, user, env);
+    const operator = await OperatorService.ensureOperator(db, user, env, logger);
     if (!operator) {
-      await this.sendMessage(env, user.id, "⚠️ این ربات فقط برای اپراتورها فعال است.");
+      await this.sendMessage(env, user.id, "⚠️ این ربات فقط برای اپراتورها فعال است.", null, logger);
+      span.end({ status: 200 });
       return new Response("ok");
     }
 
     if (operator.status === "pending") {
-      await this.sendMessage(env, user.id, "⏳ حساب شما در انتظار تایید مدیر است.");
+      await this.sendMessage(env, user.id, "⏳ حساب شما در انتظار تایید مدیر است.", null, logger);
+      span.end({ status: 200 });
       return new Response("ok");
     }
 
     if (update.message) {
-      return this.handleMessage(env, db, operator, update.message);
+      const response = await this.handleMessage(env, db, operator, update.message, logger);
+      span.end({ status: response?.status || 200 });
+      return response;
     }
     if (update.callback_query) {
-      return this.handleCallback(env, db, operator, update.callback_query);
+      const response = await this.handleCallback(env, db, operator, update.callback_query, logger);
+      span.end({ status: response?.status || 200 });
+      return response;
     }
+    span.end({ status: 200 });
     return new Response("ok");
   },
-  async handleMessage(env, db, operator, message) {
+  async handleMessage(env, db, operator, message, logger) {
+    const span = (logger || Logger).span("telegram_message", { operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
     const text = parseMessageText(message);
-    const settings = await D1.getSettings(db, operator.id);
+    const settings = await D1.getSettings(db, operator.id, logger);
 
     if (text === "/cancel") {
-      await D1.setPendingAction(db, operator.id, null, null);
-      await this.sendMessage(env, message.chat.id, "✅ عملیات لغو شد.");
+      await D1.setPendingAction(db, operator.id, null, null, logger);
+      await this.sendMessage(env, message.chat.id, "✅ عملیات لغو شد.", null, logger);
+      span.end({ action: "cancel" });
       return new Response("ok");
     }
 
     if (!text.startsWith("/") && settings?.pending_action) {
       const action = settings.pending_action;
       if (action === "set_upstream") {
-        await D1.createUpstream(db, env, operator.id, { url: text, enabled: true, weight: 1, priority: 1 });
-        await D1.setPendingAction(db, operator.id, null, null);
-        await D1.logAudit(db, {
+        await D1.createUpstream(db, env, operator.id, { url: text, enabled: true, weight: 1, priority: 1 }, logger);
+        await D1.setPendingAction(db, operator.id, null, null, logger);
+        await D1.logAudit(
+          db,
+          {
           operator_id: operator.id,
           event_type: "settings_update:upstream_url",
           meta_json: JSON.stringify({ upstream: redactUrlForLog(text) }),
-        });
-        await AuditService.notifyOperator(env, settings, "🧊 آپ‌استریم بروزرسانی شد.");
-        await this.sendMessage(env, message.chat.id, "✅ لینک آپ‌استریم ذخیره شد.");
+          },
+          logger
+        );
+        await AuditService.notifyOperator(env, settings, "🧊 آپ‌استریم بروزرسانی شد.", logger);
+        await this.sendMessage(env, message.chat.id, "✅ لینک آپ‌استریم ذخیره شد.", null, logger);
+        span.end({ action: "set_upstream" });
         return new Response("ok");
       }
       if (action === "set_domain") {
         if (!isValidDomain(text)) {
-          await this.sendMessage(env, message.chat.id, "❗️دامنه معتبر نیست.");
+          (logger || Logger).warn("domain_invalid", {
+            error_code: "E_INPUT_INVALID",
+            reason: ERROR_CODES.E_INPUT_INVALID.reason,
+            hints: ERROR_CODES.E_INPUT_INVALID.hints,
+            domain: text,
+          });
+          await this.sendMessage(env, message.chat.id, "❗️دامنه معتبر نیست.", null, logger);
+          span.end({ action: "set_domain_invalid" });
           return new Response("ok");
         }
-        await D1.createDomain(db, operator.id, text);
-        const domains = await D1.listDomains(db, operator.id);
+        await D1.createDomain(db, operator.id, text, logger);
+        const domains = await D1.listDomains(db, operator.id, logger);
         const latest = domains?.results?.[0];
-        if (latest) await D1.setDomainActive(db, operator.id, latest.id);
-        await D1.setPendingAction(db, operator.id, null, null);
-        await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:domain" });
-        await AuditService.notifyOperator(env, settings, "🧊 دامنه بروزرسانی شد.");
+        if (latest) await D1.setDomainActive(db, operator.id, latest.id, logger);
+        await D1.setPendingAction(db, operator.id, null, null, logger);
+        await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:domain" }, logger);
+        await AuditService.notifyOperator(env, settings, "🧊 دامنه بروزرسانی شد.", logger);
         const token = latest?.token ? `\nتوکن تایید: <code>${safeHtml(latest.token)}</code>` : "";
-        await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد.${token}`);
+        await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد.${token}`, null, logger);
+        span.end({ action: "set_domain" });
         return new Response("ok");
       }
       if (action === "set_channel") {
-        await D1.updateSettings(db, operator.id, { channel_id: text });
-        await D1.setPendingAction(db, operator.id, null, null);
-        await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:channel" });
-        await AuditService.notifyOperator(env, { channel_id: text }, "✅ اتصال کانال تایید شد.");
-        await this.sendMessage(env, message.chat.id, "✅ کانال اطلاع‌رسانی ذخیره شد.");
+        await D1.updateSettings(db, operator.id, { channel_id: text }, logger);
+        await D1.setPendingAction(db, operator.id, null, null, logger);
+        await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:channel" }, logger);
+        await AuditService.notifyOperator(env, { channel_id: text }, "✅ اتصال کانال تایید شد.", logger);
+        await this.sendMessage(env, message.chat.id, "✅ کانال اطلاع‌رسانی ذخیره شد.", null, logger);
+        span.end({ action: "set_channel" });
         return new Response("ok");
       }
     }
 
     if (text.startsWith("/start") || text.startsWith("/panel")) {
-      const payload = await this.buildPanel(db, operator, env);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
+      const payload = await this.buildPanel(db, operator, env, logger);
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
+      span.end({ action: "panel" });
       return new Response("ok");
     }
     if (text.startsWith("/set_upstream")) {
       const value = text.replace("/set_upstream", "").trim();
       if (!value) {
-        await D1.setPendingAction(db, operator.id, "set_upstream");
-        await this.sendMessage(env, message.chat.id, "📌 لطفاً لینک آپ‌استریم را بفرستید.");
+        await D1.setPendingAction(db, operator.id, "set_upstream", null, logger);
+        await this.sendMessage(env, message.chat.id, "📌 لطفاً لینک آپ‌استریم را بفرستید.", null, logger);
+        span.end({ action: "set_upstream_prompt" });
         return new Response("ok");
       }
-      await D1.createUpstream(db, env, operator.id, { url: value, enabled: true, weight: 1, priority: 1 });
-      await D1.logAudit(db, {
-        operator_id: operator.id,
-        event_type: "settings_update:upstream_url",
-        meta_json: JSON.stringify({ upstream: redactUrlForLog(value) }),
-      });
-      await AuditService.notifyOperator(env, settings, "🧊 آپ‌استریم بروزرسانی شد.");
-      await this.sendMessage(env, message.chat.id, "✅ لینک آپ‌استریم ذخیره شد.");
+      await D1.createUpstream(db, env, operator.id, { url: value, enabled: true, weight: 1, priority: 1 }, logger);
+      await D1.logAudit(
+        db,
+        {
+          operator_id: operator.id,
+          event_type: "settings_update:upstream_url",
+          meta_json: JSON.stringify({ upstream: redactUrlForLog(value) }),
+        },
+        logger
+      );
+      await AuditService.notifyOperator(env, settings, "🧊 آپ‌استریم بروزرسانی شد.", logger);
+      await this.sendMessage(env, message.chat.id, "✅ لینک آپ‌استریم ذخیره شد.", null, logger);
+      span.end({ action: "set_upstream" });
       return new Response("ok");
     }
     if (text.startsWith("/set_domain")) {
       const domain = text.replace("/set_domain", "").trim();
       if (!domain) {
-        await D1.setPendingAction(db, operator.id, "set_domain");
-        await this.sendMessage(env, message.chat.id, "📌 لطفاً دامنه را بفرستید.");
+        await D1.setPendingAction(db, operator.id, "set_domain", null, logger);
+        await this.sendMessage(env, message.chat.id, "📌 لطفاً دامنه را بفرستید.", null, logger);
+        span.end({ action: "set_domain_prompt" });
         return new Response("ok");
       }
       if (!isValidDomain(domain)) {
-        await this.sendMessage(env, message.chat.id, "❗️دامنه معتبر نیست.");
+        (logger || Logger).warn("domain_invalid", {
+          error_code: "E_INPUT_INVALID",
+          reason: ERROR_CODES.E_INPUT_INVALID.reason,
+          hints: ERROR_CODES.E_INPUT_INVALID.hints,
+          domain,
+        });
+        await this.sendMessage(env, message.chat.id, "❗️دامنه معتبر نیست.", null, logger);
+        span.end({ action: "set_domain_invalid" });
         return new Response("ok");
       }
-      await D1.createDomain(db, operator.id, domain);
-      const domains = await D1.listDomains(db, operator.id);
+      await D1.createDomain(db, operator.id, domain, logger);
+      const domains = await D1.listDomains(db, operator.id, logger);
       const latest = domains?.results?.[0];
-      if (latest) await D1.setDomainActive(db, operator.id, latest.id);
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:domain", meta_json: JSON.stringify({ domain }) });
-      await AuditService.notifyOperator(env, settings, "🧊 دامنه بروزرسانی شد.");
+      if (latest) await D1.setDomainActive(db, operator.id, latest.id, logger);
+      await D1.logAudit(
+        db,
+        { operator_id: operator.id, event_type: "settings_update:domain", meta_json: JSON.stringify({ domain }) },
+        logger
+      );
+      await AuditService.notifyOperator(env, settings, "🧊 دامنه بروزرسانی شد.", logger);
       const token = latest?.token ? `\nتوکن تایید: <code>${safeHtml(latest.token)}</code>` : "";
-      await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد.${token}`);
+      await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد.${token}`, null, logger);
+      span.end({ action: "set_domain" });
       return new Response("ok");
     }
     if (text.startsWith("/set_channel")) {
       const channelId = text.replace("/set_channel", "").trim();
       if (!channelId) {
-        await D1.setPendingAction(db, operator.id, "set_channel");
-        await this.sendMessage(env, message.chat.id, "📌 لطفاً شناسه کانال را بفرستید.");
+        await D1.setPendingAction(db, operator.id, "set_channel", null, logger);
+        await this.sendMessage(env, message.chat.id, "📌 لطفاً شناسه کانال را بفرستید.", null, logger);
+        span.end({ action: "set_channel_prompt" });
         return new Response("ok");
       }
-      await D1.updateSettings(db, operator.id, { channel_id: channelId });
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:channel" });
-      await AuditService.notifyOperator(env, { channel_id: channelId }, "✅ اتصال کانال تایید شد.");
-      await this.sendMessage(env, message.chat.id, "✅ کانال اطلاع‌رسانی ذخیره شد.");
+      await D1.updateSettings(db, operator.id, { channel_id: channelId }, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:channel" }, logger);
+      await AuditService.notifyOperator(env, { channel_id: channelId }, "✅ اتصال کانال تایید شد.", logger);
+      await this.sendMessage(env, message.chat.id, "✅ کانال اطلاع‌رسانی ذخیره شد.", null, logger);
+      span.end({ action: "set_channel" });
       return new Response("ok");
     }
     if (text.startsWith("/extras")) {
-      const payload = await this.buildExtrasPanel(db, operator, 0);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
+      const payload = await this.buildExtrasPanel(db, operator, 0, logger);
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
+      span.end({ action: "extras" });
       return new Response("ok");
     }
     if (text.startsWith("/add_extra")) {
       const { title, content } = parseAddExtra(text);
       if (!content) {
-        await this.sendMessage(env, message.chat.id, "❗️بعد از دستور متن کانفیگ را بفرستید. مثال: /add_extra عنوان | متن");
+        await this.sendMessage(env, message.chat.id, "❗️بعد از دستور متن کانفیگ را بفرستید. مثال: /add_extra عنوان | متن", null, logger);
+        span.end({ action: "add_extra_invalid" });
         return new Response("ok");
       }
-      await D1.createExtraConfig(db, operator.id, title, content);
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update:add" });
-      await this.sendMessage(env, message.chat.id, "✅ کانفیگ اضافی ثبت شد.");
+      await D1.createExtraConfig(db, operator.id, title, content, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update:add" }, logger);
+      await this.sendMessage(env, message.chat.id, "✅ کانفیگ اضافی ثبت شد.", null, logger);
+      span.end({ action: "add_extra" });
       return new Response("ok");
     }
     if (text.startsWith("/edit_extra")) {
@@ -1475,187 +2320,230 @@ const Telegram = {
       const [configId, ...contentParts] = parts;
       const content = contentParts.join(" ").trim();
       if (!configId || !content) {
-        await this.sendMessage(env, message.chat.id, "❗️فرمت: /edit_extra شناسه متن_جدید");
+        await this.sendMessage(env, message.chat.id, "❗️فرمت: /edit_extra شناسه متن_جدید", null, logger);
+        span.end({ action: "edit_extra_invalid" });
         return new Response("ok");
       }
-      await D1.updateExtraConfig(db, operator.id, configId, content);
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update:edit" });
-      await this.sendMessage(env, message.chat.id, "✅ کانفیگ ویرایش شد.");
+      await D1.updateExtraConfig(db, operator.id, configId, content, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update:edit" }, logger);
+      await this.sendMessage(env, message.chat.id, "✅ کانفیگ ویرایش شد.", null, logger);
+      span.end({ action: "edit_extra" });
       return new Response("ok");
     }
     if (text.startsWith("/rules")) {
-      const payload = await this.buildRulesPanel(db, operator);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
+      const payload = await this.buildRulesPanel(db, operator, logger);
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
+      span.end({ action: "rules" });
       return new Response("ok");
     }
     if (text.startsWith("/set_rules")) {
       const patch = parseRulesArgs(text);
       if (!Object.keys(patch).length) {
-        await this.sendMessage(env, message.chat.id, "❗️فرمت: /set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam format=base64");
+        await this.sendMessage(
+          env,
+          message.chat.id,
+          "❗️فرمت: /set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam format=base64",
+          null,
+          logger
+        );
+        span.end({ action: "set_rules_invalid" });
         return new Response("ok");
       }
-      await D1.updateRules(db, operator.id, patch);
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "rules_update", meta_json: JSON.stringify(patch) });
-      await this.sendMessage(env, message.chat.id, "✅ قوانین ذخیره شد.");
+      await D1.updateRules(db, operator.id, patch, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "rules_update", meta_json: JSON.stringify(patch) }, logger);
+      await this.sendMessage(env, message.chat.id, "✅ قوانین ذخیره شد.", null, logger);
+      span.end({ action: "set_rules" });
       return new Response("ok");
     }
     if (text.startsWith("/link")) {
-      const payload = await this.buildLinkPanel(db, operator, env);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
+      const payload = await this.buildLinkPanel(db, operator, env, logger);
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
+      span.end({ action: "link" });
       return new Response("ok");
     }
     if (text.startsWith("/rotate")) {
-      const primary = await D1.getPrimaryCustomerLink(db, operator.id);
-      const share = primary ? await D1.rotateCustomerLink(db, operator.id, primary.id) : await D1.createCustomerLink(db, operator.id, null, null);
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "link_rotate" });
-      const link = await OperatorService.getShareLink(db, operator, env.BASE_URL || "");
-      await this.sendMessage(env, message.chat.id, `✅ لینک جدید: <code>${safeHtml(link)}</code>`);
+      const primary = await D1.getPrimaryCustomerLink(db, operator.id, logger);
+      const share = primary
+        ? await D1.rotateCustomerLink(db, operator.id, primary.id, logger)
+        : await D1.createCustomerLink(db, operator.id, null, null, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "link_rotate" }, logger);
+      const link = await OperatorService.getShareLink(db, operator, env.BASE_URL || "", logger);
+      await this.sendMessage(env, message.chat.id, `✅ لینک جدید: <code>${safeHtml(link)}</code>`, null, logger);
+      span.end({ action: "rotate" });
       return new Response("ok");
     }
     if (text.startsWith("/logs")) {
-      const payload = await this.buildLogsPanel(db, operator);
-      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard);
+      const payload = await this.buildLogsPanel(db, operator, logger);
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
+      span.end({ action: "logs" });
       return new Response("ok");
     }
 
     if (text.startsWith("/admin_list_operators")) {
       if (!isAdmin(operator.telegram_user_id, env)) {
-        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.", null, logger);
+        span.end({ action: "admin_list_forbidden" });
         return new Response("ok");
       }
-      const operators = await D1.listOperators(db);
+      const operators = await D1.listOperators(db, logger);
       const list = (operators?.results || [])
         .map((item) => `• ${safeHtml(item.display_name || item.telegram_user_id)} (${safeHtml(item.telegram_user_id)}) - ${safeHtml(item.status)} - ${safeHtml(item.role)}`)
         .join("\n");
-      await this.sendMessage(env, message.chat.id, list || "لیست خالی است.");
+      await this.sendMessage(env, message.chat.id, list || "لیست خالی است.", null, logger);
+      span.end({ action: "admin_list_operators" });
       return new Response("ok");
     }
     if (text.startsWith("/admin_add_operator")) {
       if (!isAdmin(operator.telegram_user_id, env)) {
-        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.", null, logger);
+        span.end({ action: "admin_add_forbidden" });
         return new Response("ok");
       }
       const targetId = text.replace("/admin_add_operator", "").trim();
       if (!targetId) {
-        await this.sendMessage(env, message.chat.id, "❗️شناسه تلگرام را وارد کنید.");
+        await this.sendMessage(env, message.chat.id, "❗️شناسه تلگرام را وارد کنید.", null, logger);
+        span.end({ action: "admin_add_invalid" });
         return new Response("ok");
       }
-      const existing = await D1.getOperatorByTelegramId(db, targetId);
+      const existing = await D1.getOperatorByTelegramId(db, targetId, logger);
       if (!existing) {
-        await D1.createOperator(db, targetId, "Operator", "operator", "active");
+        await D1.createOperator(db, targetId, "Operator", "operator", "active", logger);
       }
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_add_operator" });
-      await this.sendMessage(env, message.chat.id, "✅ اپراتور اضافه شد.");
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_add_operator" }, logger);
+      await this.sendMessage(env, message.chat.id, "✅ اپراتور اضافه شد.", null, logger);
+      span.end({ action: "admin_add_operator" });
       return new Response("ok");
     }
     if (text.startsWith("/admin_remove_operator")) {
       if (!isAdmin(operator.telegram_user_id, env)) {
-        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.", null, logger);
+        span.end({ action: "admin_remove_forbidden" });
         return new Response("ok");
       }
       const targetId = text.replace("/admin_remove_operator", "").trim();
       if (!targetId) {
-        await this.sendMessage(env, message.chat.id, "❗️شناسه تلگرام را وارد کنید.");
+        await this.sendMessage(env, message.chat.id, "❗️شناسه تلگرام را وارد کنید.", null, logger);
+        span.end({ action: "admin_remove_invalid" });
         return new Response("ok");
       }
-      await D1.removeOperator(db, targetId);
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_remove_operator" });
-      await this.sendMessage(env, message.chat.id, "✅ اپراتور غیرفعال شد.");
+      await D1.removeOperator(db, targetId, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_remove_operator" }, logger);
+      await this.sendMessage(env, message.chat.id, "✅ اپراتور غیرفعال شد.", null, logger);
+      span.end({ action: "admin_remove_operator" });
       return new Response("ok");
     }
     if (text.startsWith("/admin_broadcast")) {
       if (!isAdmin(operator.telegram_user_id, env)) {
-        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.");
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.", null, logger);
+        span.end({ action: "admin_broadcast_forbidden" });
         return new Response("ok");
       }
       const messageBody = text.replace("/admin_broadcast", "").trim();
       if (!messageBody) {
-        await this.sendMessage(env, message.chat.id, "❗️متن پیام را بنویسید.");
+        await this.sendMessage(env, message.chat.id, "❗️متن پیام را بنویسید.", null, logger);
+        span.end({ action: "admin_broadcast_invalid" });
         return new Response("ok");
       }
-      const operators = await D1.listOperators(db);
+      const operators = await D1.listOperators(db, logger);
       for (const item of operators?.results || []) {
-        const opSettings = await D1.getSettings(db, item.id);
-        await AuditService.notifyOperator(env, opSettings, `📣 پیام مدیر: ${safeHtml(messageBody)}`);
+        const opSettings = await D1.getSettings(db, item.id, logger);
+        await AuditService.notifyOperator(env, opSettings, `📣 پیام مدیر: ${safeHtml(messageBody)}`, logger);
       }
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_broadcast" });
-      await this.sendMessage(env, message.chat.id, "✅ پیام ارسال شد.");
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "admin_broadcast" }, logger);
+      await this.sendMessage(env, message.chat.id, "✅ پیام ارسال شد.", null, logger);
+      span.end({ action: "admin_broadcast" });
       return new Response("ok");
     }
     if (text.startsWith("/admin_health")) {
-      await this.sendMessage(env, message.chat.id, `🟢 سلامت سیستم: ${APP.name} v${APP.version}`);
+      await this.sendMessage(env, message.chat.id, `🟢 سلامت سیستم: ${APP.name} v${APP.version}`, null, logger);
+      span.end({ action: "admin_health" });
       return new Response("ok");
     }
 
-    await this.sendMessage(env, message.chat.id, "❓ دستور ناشناخته. /panel را بزنید.");
+    await this.sendMessage(env, message.chat.id, "❓ دستور ناشناخته. /panel را بزنید.", null, logger);
+    span.end({ action: "unknown_command" });
     return new Response("ok");
   },
-  async handleCallback(env, db, operator, callback) {
-    const data = decodeCallbackData(callback.data || "");
+  async handleCallback(env, db, operator, callback, logger) {
+    const span = (logger || Logger).span("telegram_callback", { operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
+    const data = decodeCallbackData(callback.data || "", logger);
     const action = data.action || "";
     const chatId = callback.message?.chat?.id;
-    if (!chatId) return new Response("ok");
+    if (!chatId) {
+      span.end({ action: "missing_chat" });
+      return new Response("ok");
+    }
 
     if (action === "toggle_extra" && data.id) {
-      await D1.setExtraEnabled(db, operator.id, data.id, data.enabled);
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update:toggle" });
-      await this.sendMessage(env, chatId, "✅ وضعیت افزودنی تغییر کرد.");
+      await D1.setExtraEnabled(db, operator.id, data.id, data.enabled, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update:toggle" }, logger);
+      await this.sendMessage(env, chatId, "✅ وضعیت افزودنی تغییر کرد.", null, logger);
+      span.end({ action: "toggle_extra" });
       return new Response("ok");
     }
     if (action === "delete_extra" && data.id) {
-      await D1.deleteExtraConfig(db, operator.id, data.id);
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update:delete" });
-      await this.sendMessage(env, chatId, "🗑️ کانفیگ حذف شد.");
+      await D1.deleteExtraConfig(db, operator.id, data.id, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "extras_update:delete" }, logger);
+      await this.sendMessage(env, chatId, "🗑️ کانفیگ حذف شد.", null, logger);
+      span.end({ action: "delete_extra" });
       return new Response("ok");
     }
     if (action === "set_rules") {
-      await D1.updateRules(db, operator.id, data.patch || {});
-      await D1.logAudit(db, { operator_id: operator.id, event_type: "rules_update" });
-      await this.sendMessage(env, chatId, "✅ قوانین اشتراک ذخیره شد.");
+      await D1.updateRules(db, operator.id, data.patch || {}, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "rules_update" }, logger);
+      await this.sendMessage(env, chatId, "✅ قوانین اشتراک ذخیره شد.", null, logger);
+      span.end({ action: "set_rules" });
       return new Response("ok");
     }
     if (action === "panel_extras") {
       const page = Number(data.page || 0);
-      const payload = await this.buildExtrasPanel(db, operator, page);
-      await this.sendMessage(env, chatId, payload.text, payload.keyboard);
+      const payload = await this.buildExtrasPanel(db, operator, page, logger);
+      await this.sendMessage(env, chatId, payload.text, payload.keyboard, logger);
+      span.end({ action: "panel_extras" });
       return new Response("ok");
     }
     if (action === "panel_rules") {
-      const payload = await this.buildRulesPanel(db, operator);
-      await this.sendMessage(env, chatId, payload.text, payload.keyboard);
+      const payload = await this.buildRulesPanel(db, operator, logger);
+      await this.sendMessage(env, chatId, payload.text, payload.keyboard, logger);
+      span.end({ action: "panel_rules" });
       return new Response("ok");
     }
     if (action === "panel_channel") {
-      await D1.setPendingAction(db, operator.id, "set_channel");
-      await this.sendMessage(env, chatId, "📌 شناسه کانال را ارسال کنید.");
+      await D1.setPendingAction(db, operator.id, "set_channel", null, logger);
+      await this.sendMessage(env, chatId, "📌 شناسه کانال را ارسال کنید.", null, logger);
+      span.end({ action: "panel_channel" });
       return new Response("ok");
     }
     if (action === "panel_upstream") {
-      await D1.setPendingAction(db, operator.id, "set_upstream");
-      await this.sendMessage(env, chatId, "📌 لینک آپ‌استریم را ارسال کنید.");
+      await D1.setPendingAction(db, operator.id, "set_upstream", null, logger);
+      await this.sendMessage(env, chatId, "📌 لینک آپ‌استریم را ارسال کنید.", null, logger);
+      span.end({ action: "panel_upstream" });
       return new Response("ok");
     }
     if (action === "panel_domain") {
-      await D1.setPendingAction(db, operator.id, "set_domain");
-      await this.sendMessage(env, chatId, "📌 دامنه را ارسال کنید.");
+      await D1.setPendingAction(db, operator.id, "set_domain", null, logger);
+      await this.sendMessage(env, chatId, "📌 دامنه را ارسال کنید.", null, logger);
+      span.end({ action: "panel_domain" });
       return new Response("ok");
     }
     if (action === "show_link") {
-      const payload = await this.buildLinkPanel(db, operator, env);
-      await this.sendMessage(env, chatId, payload.text, payload.keyboard);
+      const payload = await this.buildLinkPanel(db, operator, env, logger);
+      await this.sendMessage(env, chatId, payload.text, payload.keyboard, logger);
+      span.end({ action: "show_link" });
       return new Response("ok");
     }
 
-    await this.sendMessage(env, chatId, "✅ انجام شد.");
+    await this.sendMessage(env, chatId, "✅ انجام شد.", null, logger);
+    span.end({ action });
     return new Response("ok");
   },
-  async buildPanel(db, operator, env) {
-    const settings = await D1.getSettings(db, operator.id);
-    const domains = await D1.listDomains(db, operator.id);
+  async buildPanel(db, operator, env, logger) {
+    const settings = await D1.getSettings(db, operator.id, logger);
+    const domains = await D1.listDomains(db, operator.id, logger);
     const activeDomain = (domains?.results || []).find((item) => item.active);
-    const snapshot = await D1.getLatestSnapshotInfo(db, operator.id);
+    const snapshot = await D1.getLatestSnapshotInfo(db, operator.id, logger);
     const snapshotFresh = snapshot && isSnapshotFresh(snapshot) ? "تازه" : "نیازمند بروزرسانی";
-    const shareLink = await OperatorService.getShareLink(db, operator, env.BASE_URL || "");
+    const shareLink = await OperatorService.getShareLink(db, operator, env.BASE_URL || "", logger);
     const text = `
 ${GLASS} <b>پنل اپراتور</b>
 
@@ -1696,17 +2584,17 @@ ${GLASS} <b>پنل اپراتور</b>
     };
     return { text, keyboard };
   },
-  async buildLinkPanel(db, operator, env) {
+  async buildLinkPanel(db, operator, env, logger) {
     let baseUrl = env.BASE_URL || "";
-    const link = await OperatorService.getShareLink(db, operator, baseUrl);
+    const link = await OperatorService.getShareLink(db, operator, baseUrl, logger);
     if (!baseUrl && link.startsWith("http")) {
       baseUrl = new URL(link).origin;
     }
-    const settings = await D1.getSettings(db, operator.id);
-    const activeDomain = settings?.active_domain_id ? await D1.getDomainById(db, settings.active_domain_id) : null;
-    const extrasCount = await D1.countExtraConfigs(db, operator.id);
-    const rules = await D1.getRules(db, operator.id);
-    const snapshot = await D1.getLatestSnapshotInfo(db, operator.id);
+    const settings = await D1.getSettings(db, operator.id, logger);
+    const activeDomain = settings?.active_domain_id ? await D1.getDomainById(db, settings.active_domain_id, logger) : null;
+    const extrasCount = await D1.countExtraConfigs(db, operator.id, logger);
+    const rules = await D1.getRules(db, operator.id, logger);
+    const snapshot = await D1.getLatestSnapshotInfo(db, operator.id, logger);
     const snapshotFresh = snapshot && isSnapshotFresh(snapshot) ? "تازه" : "نیازمند بروزرسانی";
     const text = `
 ${GLASS} <b>لینک اشتراک برند شما</b>
@@ -1738,11 +2626,11 @@ Merge policy: ${safeHtml(rules?.merge_policy || "append")}
     };
     return { text, keyboard };
   },
-  async buildExtrasPanel(db, operator, page = 0) {
+  async buildExtrasPanel(db, operator, page = 0, logger) {
     const limit = 5;
     const offset = page * limit;
-    const extras = await D1.listExtraConfigs(db, operator.id, limit, offset);
-    const total = await D1.countExtraConfigs(db, operator.id);
+    const extras = await D1.listExtraConfigs(db, operator.id, limit, offset, logger);
+    const total = await D1.countExtraConfigs(db, operator.id, logger);
     const list = (extras?.results || [])
       .map((item) => `• ${safeHtml(item.title || "افزودنی")} (${safeHtml(item.id)}) ${item.enabled ? "✅" : "⛔️"}`)
       .join("\n");
@@ -1773,8 +2661,8 @@ ${list || "فعلاً موردی ثبت نشده."}
     };
     return { text, keyboard };
   },
-  async buildRulesPanel(db, operator) {
-    const rules = await D1.getRules(db, operator.id);
+  async buildRulesPanel(db, operator, logger) {
+    const rules = await D1.getRules(db, operator.id, logger);
     const text = `
 ${GLASS} <b>قوانین اشتراک</b>
 
@@ -1802,8 +2690,8 @@ ${GLASS} <b>قوانین اشتراک</b>
     };
     return { text, keyboard };
   },
-  async buildLogsPanel(db, operator) {
-    const logs = await D1.listAuditLogs(db, operator.id, 5);
+  async buildLogsPanel(db, operator, logger) {
+    const logs = await D1.listAuditLogs(db, operator.id, 5, logger);
     const items = (logs?.results || [])
       .map((log) => `• ${safeHtml(log.event_type)} ${safeHtml(log.created_at)}`)
       .join("\n");
@@ -1814,7 +2702,7 @@ ${items || "فعلاً لاگی ثبت نشده."}
     `.trim();
     return { text, keyboard: null };
   },
-  async sendMessage(env, chatId, text, keyboard) {
+  async sendMessage(env, chatId, text, keyboard, logger) {
     const body = {
       chat_id: chatId,
       text,
@@ -1822,11 +2710,16 @@ ${items || "فعلاً لاگی ثبت نشده."}
       disable_web_page_preview: true,
     };
     if (keyboard) body.reply_markup = keyboard;
-    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    await fetchWithLogs(
+      `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      { label: "telegram_send_message", error_code: "E_TELEGRAM_API" },
+      logger
+    );
   },
 };
 
@@ -1834,71 +2727,104 @@ ${items || "فعلاً لاگی ثبت نشده."}
 // HTTP Router
 // =============================
 const Router = {
-  async handle(request, env, ctx) {
+  async handle(request, env, ctx, logger, requestId) {
     const url = new URL(request.url);
+    (logger || Logger).info("router_dispatch", { route: scrubPathForLog(url.pathname) });
     if (request.method === "POST" && url.pathname === "/webhook") {
-      return Telegram.handleWebhook(request, env);
+      return Telegram.handleWebhook(request, env, logger);
     }
     if (request.method === "POST" && url.pathname === "/auth/telegram") {
-      return this.handleTelegramLogin(request, env);
+      return this.handleTelegramLogin(request, env, logger);
     }
     if (request.method === "GET" && url.pathname.startsWith("/sub/")) {
       const token = url.pathname.split("/").pop();
-      return this.handleSubscription(request, env, token, ctx);
+      return this.handleSubscription(request, env, token, ctx, logger, requestId);
     }
     if (request.method === "GET" && url.pathname === "/redirect") {
-      return this.handleRedirect(url);
+      return this.handleRedirect(url, logger);
     }
     if (request.method === "GET" && url.pathname.startsWith("/verify-domain/")) {
-      return this.handleVerifyDomain(request, env, url);
+      return this.handleVerifyDomain(request, env, url, logger);
     }
     if (request.method === "GET" && url.pathname === "/health") {
-      return this.handleHealth(env);
+      return this.handleHealth(env, logger);
     }
     if (request.method === "GET" && url.pathname === "/api/v1/health/full") {
-      return this.handleHealthFull(env);
+      return this.handleHealthFull(env, logger);
     }
     if (request.method === "POST" && url.pathname === "/admin/purge") {
-      return this.handlePurge(request, env);
+      return this.handlePurge(request, env, logger);
     }
     if (url.pathname.startsWith("/api/v1/")) {
-      return this.handleApi(request, env);
+      return this.handleApi(request, env, logger);
     }
     if (request.method === "GET" && url.pathname === "/") {
-      return this.handleLanding(request, env);
+      return this.handleLanding(request, env, logger);
     }
     return new Response("not found", { status: 404 });
   },
-  async handlePurge(request, env) {
-    const ctx = await AuthService.getAuthContext(request, env, env.DB);
-    if (!ctx || !isAdmin(ctx.operator.telegram_user_id, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+  async handlePurge(request, env, logger) {
+    const span = (logger || Logger).span("admin_purge");
+    const ctx = await AuthService.getAuthContext(request, env, env.DB, logger);
+    if (!ctx || !isAdmin(ctx.operator.telegram_user_id, env)) {
+      span.end({ status: 403 });
+      return jsonResponse({ ok: false, error: "forbidden" }, 403);
+    }
     const url = new URL(request.url);
     const days = Number(url.searchParams.get("days") || APP.purgeRetentionDays);
     const retentionMs = Math.max(1, days) * 24 * 60 * 60 * 1000;
-    await D1.purgeOldRecords(env.DB, retentionMs);
+    const scopedLogger = logger.child({ operator_id: ctx.operator.id, telegram_user_id: ctx.operator.telegram_user_id });
+    await D1.purgeOldRecords(env.DB, retentionMs, scopedLogger);
+    span.end({ status: 200, retention_days: days });
     return jsonResponse({ ok: true, retention_days: days });
   },
-  async handleTelegramLogin(request, env) {
+  async handleTelegramLogin(request, env, logger) {
+    const span = (logger || Logger).span("telegram_login");
     if (!env.TELEGRAM_TOKEN || !env.SESSION_SECRET) {
+      span.end({ status: 500 });
       return jsonResponse({ ok: false, error: "missing_env" }, 500);
     }
-    const body = await parseJsonBody(request);
-    if (!body) return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+    const body = await parseJsonBody(request, logger);
+    if (!body) {
+      (logger || Logger).warn("telegram_login_invalid_body", {
+        error_code: "E_INPUT_INVALID",
+        reason: ERROR_CODES.E_INPUT_INVALID.reason,
+        hints: ERROR_CODES.E_INPUT_INVALID.hints,
+      });
+      span.end({ status: 400 });
+      return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+    }
     const ok = await validateTelegramLogin(body, env.TELEGRAM_TOKEN);
-    if (!ok) return jsonResponse({ ok: false, error: "invalid_auth" }, 403);
+    if (!ok) {
+      (logger || Logger).warn("telegram_login_invalid_auth", {
+        error_code: "E_AUTH_UNAUTHORIZED",
+        reason: ERROR_CODES.E_AUTH_UNAUTHORIZED.reason,
+        hints: ERROR_CODES.E_AUTH_UNAUTHORIZED.hints,
+      });
+      span.end({ status: 403 });
+      return jsonResponse({ ok: false, error: "invalid_auth" }, 403);
+    }
     const telegramId = body.id;
     const displayName = body.first_name || body.username || "Operator";
-    let operator = await D1.getOperatorByTelegramId(env.DB, telegramId);
+    let operator = await D1.getOperatorByTelegramId(env.DB, telegramId, logger);
     if (!operator) {
       let status = "pending";
       if (isAdmin(telegramId, env)) status = "active";
       if (body.invite_code) {
-        const invite = await D1.getInviteCode(env.DB, body.invite_code);
-        if (!invite || invite.used_at) return jsonResponse({ ok: false, error: "invalid_invite" }, 403);
-        operator = await D1.createOperator(env.DB, telegramId, displayName, "operator", status);
-        await D1.useInviteCode(env.DB, body.invite_code, operator.id);
+        const invite = await D1.getInviteCode(env.DB, body.invite_code, logger);
+        if (!invite || invite.used_at) {
+          (logger || Logger).warn("telegram_login_invalid_invite", {
+            error_code: "E_AUTH_FORBIDDEN",
+            reason: ERROR_CODES.E_AUTH_FORBIDDEN.reason,
+            hints: ERROR_CODES.E_AUTH_FORBIDDEN.hints,
+          });
+          span.end({ status: 403 });
+          return jsonResponse({ ok: false, error: "invalid_invite" }, 403);
+        }
+        operator = await D1.createOperator(env.DB, telegramId, displayName, "operator", status, logger);
+        await D1.useInviteCode(env.DB, body.invite_code, operator.id, logger);
       } else {
-        operator = await D1.createOperator(env.DB, telegramId, displayName, "operator", status);
+        operator = await D1.createOperator(env.DB, telegramId, displayName, "operator", status, logger);
       }
     }
     const payload = {
@@ -1908,53 +2834,83 @@ const Router = {
       exp: Math.floor(Date.now() / 1000) + APP.sessionTtlSec,
     };
     const token = await signSession(payload, env.SESSION_SECRET);
+    span.end({ status: 200, operator_id: operator.id });
     return jsonResponse({ ok: true, token, status: operator.status });
   },
-  async handleApi(request, env) {
-    const ctx = await AuthService.getAuthContext(request, env, env.DB);
-    if (!ctx) return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  async handleApi(request, env, logger) {
+    const span = (logger || Logger).span("api_request");
+    const ctx = await AuthService.getAuthContext(request, env, env.DB, logger);
+    if (!ctx) {
+      span.end({ status: 401 });
+      return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+    }
     const { operator } = ctx;
+    const apiLogger = logger.child({ operator_id: operator.id, telegram_user_id: operator.telegram_user_id, token_type: ctx.tokenType });
     const url = new URL(request.url);
     const path = url.pathname.replace("/api/v1", "");
     if (request.method === "GET" && path === "/operators/me/upstreams") {
-      const data = await D1.listUpstreamsAll(env.DB, operator.id);
+      const data = await D1.listUpstreamsAll(env.DB, operator.id, apiLogger);
       const masked = await Promise.all(
         (data?.results || []).map(async (item) => {
           const plainUrl = await decryptUpstreamUrl(env, item.url);
           return { ...item, url: redactUrlForDisplay(plainUrl) };
         })
       );
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true, data: masked });
     }
     if (request.method === "POST" && path === "/operators/me/upstreams") {
-      const body = await parseJsonBody(request);
-      if (!body?.url) return jsonResponse({ ok: false, error: "invalid_body" }, 400);
-      await D1.createUpstream(env.DB, env, operator.id, body);
-      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_upstream_create" });
+      const body = await parseJsonBody(request, apiLogger);
+      if (!body?.url) {
+        apiLogger.warn("api_invalid_body", {
+          error_code: "E_INPUT_INVALID",
+          reason: ERROR_CODES.E_INPUT_INVALID.reason,
+          hints: ERROR_CODES.E_INPUT_INVALID.hints,
+          path,
+        });
+        span.end({ status: 400, path });
+        return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+      }
+      await D1.createUpstream(env.DB, env, operator.id, body, apiLogger);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_upstream_create" }, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true });
     }
     if (request.method === "POST" && path === "/operators/me/extras") {
-      const body = await parseJsonBody(request);
-      if (!body?.content) return jsonResponse({ ok: false, error: "invalid_body" }, 400);
-      await D1.createExtraConfig(env.DB, operator.id, body.title, body.content);
-      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_extra_create" });
+      const body = await parseJsonBody(request, apiLogger);
+      if (!body?.content) {
+        apiLogger.warn("api_invalid_body", {
+          error_code: "E_INPUT_INVALID",
+          reason: ERROR_CODES.E_INPUT_INVALID.reason,
+          hints: ERROR_CODES.E_INPUT_INVALID.hints,
+          path,
+        });
+        span.end({ status: 400, path });
+        return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+      }
+      await D1.createExtraConfig(env.DB, operator.id, body.title, body.content, apiLogger);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_extra_create" }, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true });
     }
     if (request.method === "POST" && path === "/operators/me/customer-links") {
-      const body = await parseJsonBody(request);
-      const link = await D1.createCustomerLink(env.DB, operator.id, body?.label, body?.overrides);
-      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_customer_link_create" });
+      const body = await parseJsonBody(request, apiLogger);
+      const link = await D1.createCustomerLink(env.DB, operator.id, body?.label, body?.overrides, apiLogger);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_customer_link_create" }, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true, data: link });
     }
     if (request.method === "GET" && path === "/operators/me/customer-links") {
-      const links = await D1.listCustomerLinks(env.DB, operator.id);
+      const links = await D1.listCustomerLinks(env.DB, operator.id, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true, data: links?.results || [] });
     }
     if (request.method === "GET" && path === "/operators/me/status") {
-      const settings = await D1.getSettings(env.DB, operator.id);
-      const domains = await D1.listDomains(env.DB, operator.id);
+      const settings = await D1.getSettings(env.DB, operator.id, apiLogger);
+      const domains = await D1.listDomains(env.DB, operator.id, apiLogger);
       const activeDomain = (domains?.results || []).find((item) => item.active);
-      const snapshot = await D1.getLatestSnapshotInfo(env.DB, operator.id);
+      const snapshot = await D1.getLatestSnapshotInfo(env.DB, operator.id, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({
         ok: true,
         data: {
@@ -1969,46 +2925,90 @@ const Router = {
     }
     if (request.method === "POST" && path.startsWith("/operators/me/customer-links/") && path.endsWith("/rotate")) {
       const id = path.split("/")[4];
-      if (!id) return jsonResponse({ ok: false, error: "missing_id" }, 400);
-      const link = await D1.rotateCustomerLink(env.DB, operator.id, id);
-      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_customer_link_rotate" });
+      if (!id) {
+        apiLogger.warn("api_missing_id", {
+          error_code: "E_INPUT_INVALID",
+          reason: ERROR_CODES.E_INPUT_INVALID.reason,
+          hints: ERROR_CODES.E_INPUT_INVALID.hints,
+          path,
+        });
+        span.end({ status: 400, path });
+        return jsonResponse({ ok: false, error: "missing_id" }, 400);
+      }
+      const link = await D1.rotateCustomerLink(env.DB, operator.id, id, apiLogger);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_customer_link_rotate" }, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true, data: link });
     }
     if (request.method === "PATCH" && path === "/operators/me/rules") {
-      const body = await parseJsonBody(request);
-      if (!body) return jsonResponse({ ok: false, error: "invalid_body" }, 400);
-      await D1.updateRules(env.DB, operator.id, body);
-      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_rules_update" });
+      const body = await parseJsonBody(request, apiLogger);
+      if (!body) {
+        apiLogger.warn("api_invalid_body", {
+          error_code: "E_INPUT_INVALID",
+          reason: ERROR_CODES.E_INPUT_INVALID.reason,
+          hints: ERROR_CODES.E_INPUT_INVALID.hints,
+          path,
+        });
+        span.end({ status: 400, path });
+        return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+      }
+      await D1.updateRules(env.DB, operator.id, body, apiLogger);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_rules_update" }, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true });
     }
     if (request.method === "GET" && path === "/operators/me/domains") {
-      const domains = await D1.listDomains(env.DB, operator.id);
+      const domains = await D1.listDomains(env.DB, operator.id, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true, data: domains?.results || [] });
     }
     if (request.method === "POST" && path === "/operators/me/api-keys") {
-      const body = await parseJsonBody(request);
+      const body = await parseJsonBody(request, apiLogger);
       const rawKey = body?.key || crypto.randomUUID();
       const keyHash = await hashApiKey(rawKey);
-      await D1.createApiKey(env.DB, operator.id, keyHash, body?.scopes ? JSON.stringify(body.scopes) : null);
-      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_key_create" });
+      await D1.createApiKey(env.DB, operator.id, keyHash, body?.scopes ? JSON.stringify(body.scopes) : null, apiLogger);
+      await D1.logAudit(env.DB, { operator_id: operator.id, event_type: "api_key_create" }, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true, key: rawKey });
     }
     if (request.method === "POST" && path === "/admin/invite-codes") {
-      if (!isAdmin(operator.telegram_user_id, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+      if (!isAdmin(operator.telegram_user_id, env)) {
+        apiLogger.warn("api_forbidden", {
+          error_code: "E_AUTH_FORBIDDEN",
+          reason: ERROR_CODES.E_AUTH_FORBIDDEN.reason,
+          hints: ERROR_CODES.E_AUTH_FORBIDDEN.hints,
+          path,
+        });
+        span.end({ status: 403, path });
+        return jsonResponse({ ok: false, error: "forbidden" }, 403);
+      }
       const code = crypto.randomUUID().split("-")[0];
-      await D1.createInviteCode(env.DB, code, operator.id);
+      await D1.createInviteCode(env.DB, code, operator.id, apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true, code });
     }
     if (request.method === "POST" && path.startsWith("/admin/operators/") && path.endsWith("/approve")) {
-      if (!isAdmin(operator.telegram_user_id, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+      if (!isAdmin(operator.telegram_user_id, env)) {
+        apiLogger.warn("api_forbidden", {
+          error_code: "E_AUTH_FORBIDDEN",
+          reason: ERROR_CODES.E_AUTH_FORBIDDEN.reason,
+          hints: ERROR_CODES.E_AUTH_FORBIDDEN.hints,
+          path,
+        });
+        span.end({ status: 403, path });
+        return jsonResponse({ ok: false, error: "forbidden" }, 403);
+      }
       const id = path.split("/")[3];
-      await D1.updateOperatorStatus(env.DB, id, "active");
+      await D1.updateOperatorStatus(env.DB, id, "active", apiLogger);
+      span.end({ status: 200, path });
       return jsonResponse({ ok: true });
     }
+    span.end({ status: 404, path });
     return jsonResponse({ ok: false, error: "not_found" }, 404);
   },
-  async handleSubscription(request, env, token, ctx) {
-    const requestId = crypto.randomUUID();
+  async handleSubscription(request, env, token, ctx, logger, requestId) {
+    const span = (logger || Logger).span("subscription_request", { token_prefix: token.slice(0, 6) });
+    const scopedLogger = (logger || Logger).child({ token_prefix: token.slice(0, 6) });
     const cacheKey = `sub:${token}`;
     const db = env.DB;
     let link = null;
@@ -2053,38 +3053,71 @@ const Router = {
     }
 
     if (!snapshot) {
-      snapshot = await SnapshotService.getSnapshot(env, token);
+      snapshot = await SnapshotService.getSnapshot(env, token, scopedLogger);
       if (snapshot) {
         cachedBody = snapshot.body_value;
-        cachedHeaders = buildSnapshotHeaders(snapshot, requestId);
+        cachedHeaders = buildSnapshotHeaders(snapshot, requestId, scopedLogger);
         cacheSource = env.SNAP_KV ? "kv" : "db";
         setCachedSub(cacheKey, snapshot.body_value, cachedHeaders, { snapshot });
       }
     }
 
     if (!snapshot?.operator_id) {
-      link = await D1.getCustomerLinkByToken(db, token);
-      if (!link) return new Response("not found", { status: 404 });
+      link = await D1.getCustomerLinkByToken(db, token, scopedLogger);
+      if (!link) {
+        scopedLogger.warn("subscription_not_found", {
+          error_code: "E_INPUT_INVALID",
+          reason: ERROR_CODES.E_INPUT_INVALID.reason,
+          hints: ERROR_CODES.E_INPUT_INVALID.hints,
+        });
+        span.end({ status: 404 });
+        return new Response("not found", { status: 404 });
+      }
     }
     const operatorId = snapshot?.operator_id || link.operator_id;
-    const settings = snapshot?.quotas_json ? null : await D1.getSettings(db, operatorId);
-    const quotas = safeParseJson(snapshot?.quotas_json || settings?.quotas_json, {});
+    const operatorLogger = scopedLogger.child({ operator_id: operatorId });
+    const settings = snapshot?.quotas_json ? null : await D1.getSettings(db, operatorId, operatorLogger);
+    const quotas = safeJsonParse(snapshot?.quotas_json || settings?.quotas_json, {}, operatorLogger, { error_code: "E_JSON_PARSE", context: "quotas" });
     const perIp = quotas?.per_ip ?? APP.rateLimitMax;
     const perToken = quotas?.per_token ?? APP.rateLimitMax;
     const perOperator = quotas?.per_operator ?? APP.rateLimitMax * 10;
     const ip = request.headers.get("cf-connecting-ip") || "unknown";
 
     if (!rateLimit(`sub-ip:${ip}`)) {
-      const ok = await D1.bumpRateLimit(db, `sub-ip:${ip}`, APP.rateLimitWindowMs, perIp);
-      if (!ok) return new Response("rate limit", { status: 429 });
+      const ok = await D1.bumpRateLimit(db, `sub-ip:${ip}`, APP.rateLimitWindowMs, perIp, operatorLogger);
+      if (!ok) {
+        operatorLogger.warn("subscription_rate_limited_ip", {
+          error_code: "E_RATE_LIMIT",
+          reason: ERROR_CODES.E_RATE_LIMIT.reason,
+          hints: ERROR_CODES.E_RATE_LIMIT.hints,
+          ip,
+        });
+        return new Response("rate limit", { status: 429 });
+      }
     }
     if (!rateLimit(`sub-token:${token}`)) {
-      const ok = await D1.bumpRateLimit(db, `sub-token:${token}`, APP.rateLimitWindowMs, perToken);
-      if (!ok) return new Response("rate limit", { status: 429 });
+      const ok = await D1.bumpRateLimit(db, `sub-token:${token}`, APP.rateLimitWindowMs, perToken, operatorLogger);
+      if (!ok) {
+        operatorLogger.warn("subscription_rate_limited_token", {
+          error_code: "E_RATE_LIMIT",
+          reason: ERROR_CODES.E_RATE_LIMIT.reason,
+          hints: ERROR_CODES.E_RATE_LIMIT.hints,
+          token_prefix: token.slice(0, 6),
+        });
+        return new Response("rate limit", { status: 429 });
+      }
     }
     if (!rateLimit(`sub-op:${operatorId}`)) {
-      const ok = await D1.bumpRateLimit(db, `sub-op:${operatorId}`, APP.rateLimitWindowMs, perOperator);
-      if (!ok) return new Response("rate limit", { status: 429 });
+      const ok = await D1.bumpRateLimit(db, `sub-op:${operatorId}`, APP.rateLimitWindowMs, perOperator, operatorLogger);
+      if (!ok) {
+        operatorLogger.warn("subscription_rate_limited_operator", {
+          error_code: "E_RATE_LIMIT",
+          reason: ERROR_CODES.E_RATE_LIMIT.reason,
+          hints: ERROR_CODES.E_RATE_LIMIT.hints,
+          operator_id: operatorId,
+        });
+        return new Response("rate limit", { status: 429 });
+      }
     }
 
     if (snapshot && cachedBody && isSnapshotFresh(snapshot)) {
@@ -2093,132 +3126,213 @@ const Router = {
         const lastAt = snapshot?.last_fetch_notify_at || settings?.last_fetch_notify_at;
         const last = lastAt ? Date.parse(lastAt) : 0;
         if (Date.now() - last > APP.notifyFetchIntervalMs) {
-          await AuditService.notifyOperator(env, settings || { operator_id: operatorId, channel_id: snapshot?.channel_id }, `🧊 اشتراک دریافت شد: <b>${safeHtml(token)}</b>`);
-          await D1.updateSettings(db, operatorId, { last_fetch_notify_at: nowIso() });
+          await AuditService.notifyOperator(
+            env,
+            settings || { operator_id: operatorId, channel_id: snapshot?.channel_id },
+            `🧊 اشتراک دریافت شد: <b>${safeHtml(token)}</b>`,
+            operatorLogger
+          );
+          await D1.updateSettings(db, operatorId, { last_fetch_notify_at: nowIso() }, operatorLogger);
         }
       }
       if (Math.random() < APP.auditSampleRate) {
-        await D1.logAudit(db, {
+        await D1.logAudit(
+          db,
+          {
+            operator_id: operatorId,
+            event_type: "subscription_fetch",
+            ip,
+            country: request.headers.get("cf-ipcountry"),
+            user_agent: request.headers.get("user-agent"),
+            request_path: new URL(request.url).pathname,
+            response_status: 200,
+            meta_json: JSON.stringify({ cache: cacheSource || "snapshot", request_id: requestId }),
+          },
+          operatorLogger
+        );
+      }
+      span.end({ status: 200, cache: cacheSource || "snapshot" });
+      return new Response(cachedBody, { headers: { ...cachedHeaders, "x-request-id": requestId } });
+    }
+
+    if (ctx) ctx.waitUntil(refreshSnapshot(env, token, request, requestId, operatorLogger));
+
+    const lastGoodMem = getLastGoodMem(cacheKey);
+    if (lastGoodMem) {
+      await D1.logAudit(
+        db,
+        {
           operator_id: operatorId,
-          event_type: "subscription_fetch",
+          event_type: "subscription_fallback",
           ip,
           country: request.headers.get("cf-ipcountry"),
           user_agent: request.headers.get("user-agent"),
           request_path: new URL(request.url).pathname,
           response_status: 200,
-          meta_json: JSON.stringify({ cache: cacheSource || "snapshot", request_id: requestId }),
-        });
-      }
-      return new Response(cachedBody, { headers: { ...cachedHeaders, "x-request-id": requestId } });
-    }
-
-    if (ctx) ctx.waitUntil(refreshSnapshot(env, token, request, requestId));
-
-    const lastGoodMem = getLastGoodMem(cacheKey);
-    if (lastGoodMem) {
-      await D1.logAudit(db, {
-        operator_id: operatorId,
-        event_type: "subscription_fallback",
-        ip,
-        country: request.headers.get("cf-ipcountry"),
-        user_agent: request.headers.get("user-agent"),
-        request_path: new URL(request.url).pathname,
-        response_status: 200,
-        meta_json: JSON.stringify({ cache: "memory_lkg", request_id: requestId }),
-      });
+          meta_json: JSON.stringify({ cache: "memory_lkg", request_id: requestId }),
+        },
+        scopedLogger
+      );
+      span.end({ status: 200, cache: "memory_lkg" });
       return new Response(lastGoodMem.body, { headers: { ...lastGoodMem.headers, "x-request-id": requestId } });
     }
 
-    const lastGood = await SnapshotService.getLastKnownGood(env, operatorId, token);
+    const lastGood = await SnapshotService.getLastKnownGood(env, operatorId, token, operatorLogger);
     if (lastGood?.body_value) {
-      let headersParsed = DEFAULT_HEADERS;
-      try {
-        headersParsed = lastGood.headers_json ? JSON.parse(lastGood.headers_json) : DEFAULT_HEADERS;
-      } catch {
-        headersParsed = DEFAULT_HEADERS;
-      }
+      const headersParsed = lastGood.headers_json
+        ? safeJsonParse(lastGood.headers_json, DEFAULT_HEADERS, operatorLogger, { error_code: "E_JSON_PARSE", context: "last_known_good_headers" })
+        : DEFAULT_HEADERS;
       const body = lastGood.body_value;
       setLastGoodMem(cacheKey, body, headersParsed, { body_format: lastGood.body_format });
-      await D1.logAudit(db, {
-        operator_id: operatorId,
-        event_type: "subscription_fallback",
-        ip,
-        country: request.headers.get("cf-ipcountry"),
-        user_agent: request.headers.get("user-agent"),
-        request_path: new URL(request.url).pathname,
-        response_status: 200,
-        meta_json: JSON.stringify({ cache: "lkg", request_id: requestId }),
-      });
+      await D1.logAudit(
+        db,
+        {
+          operator_id: operatorId,
+          event_type: "subscription_fallback",
+          ip,
+          country: request.headers.get("cf-ipcountry"),
+          user_agent: request.headers.get("user-agent"),
+          request_path: new URL(request.url).pathname,
+          response_status: 200,
+          meta_json: JSON.stringify({ cache: "lkg", request_id: requestId }),
+        },
+        operatorLogger
+      );
+      span.end({ status: 200, cache: "lkg" });
       return new Response(body, { headers: { ...headersParsed, "x-request-id": requestId } });
     }
 
     if (snapshot) {
-      await D1.logAudit(db, {
+      await D1.logAudit(
+        db,
+        {
+          operator_id: operatorId,
+          event_type: "subscription_fallback",
+          ip,
+          country: request.headers.get("cf-ipcountry"),
+          user_agent: request.headers.get("user-agent"),
+          request_path: new URL(request.url).pathname,
+          response_status: 200,
+          meta_json: JSON.stringify({ cache: "stale_snapshot", request_id: requestId }),
+        },
+        operatorLogger
+      );
+      span.end({ status: 200, cache: "stale_snapshot" });
+      return buildSnapshotResponse(snapshot, requestId, operatorLogger);
+    }
+
+    await D1.logAudit(
+      db,
+      {
         operator_id: operatorId,
-        event_type: "subscription_fallback",
+        event_type: "subscription_error",
         ip,
         country: request.headers.get("cf-ipcountry"),
         user_agent: request.headers.get("user-agent"),
         request_path: new URL(request.url).pathname,
-        response_status: 200,
-        meta_json: JSON.stringify({ cache: "stale_snapshot", request_id: requestId }),
-      });
-      return buildSnapshotResponse(snapshot, requestId);
-    }
-
-    await D1.logAudit(db, {
-      operator_id: operatorId,
-      event_type: "subscription_error",
-      ip,
-      country: request.headers.get("cf-ipcountry"),
-      user_agent: request.headers.get("user-agent"),
-      request_path: new URL(request.url).pathname,
-      response_status: 502,
-      meta_json: JSON.stringify({ reason: "no_snapshot", request_id: requestId }),
-    });
+        response_status: 502,
+        meta_json: JSON.stringify({ reason: "no_snapshot", request_id: requestId }),
+      },
+      operatorLogger
+    );
+    span.end({ status: 200, cache: "none" });
     return new Response(utf8SafeEncode("# upstream_invalid"), {
       headers: { ...DEFAULT_HEADERS, "x-request-id": requestId },
       status: 200,
     });
   },
-  handleRedirect(url) {
+  handleRedirect(url, logger) {
+    const span = (logger || Logger).span("redirect_request");
     const target = url.searchParams.get("target") || "";
-    if (!target) return new Response("bad request", { status: 400 });
-    if (target.length > APP.maxRedirectTargetBytes || hasCRLF(target)) return new Response("blocked", { status: 400 });
+    if (!target) {
+      span.end({ status: 400 });
+      return new Response("bad request", { status: 400 });
+    }
+    if (target.length > APP.maxRedirectTargetBytes || hasCRLF(target)) {
+      (logger || Logger).warn("redirect_blocked", {
+        error_code: "E_INPUT_INVALID",
+        reason: ERROR_CODES.E_INPUT_INVALID.reason,
+        hints: ERROR_CODES.E_INPUT_INVALID.hints,
+        blocked_reason: "length_or_crlf",
+      });
+      span.end({ status: 400 });
+      return new Response("blocked", { status: 400 });
+    }
     let parsed;
     try {
       parsed = new URL(target);
     } catch {
+      (logger || Logger).warn("redirect_invalid_url", {
+        error_code: "E_INPUT_INVALID",
+        reason: ERROR_CODES.E_INPUT_INVALID.reason,
+        hints: ERROR_CODES.E_INPUT_INVALID.hints,
+      });
+      span.end({ status: 400 });
       return new Response("invalid", { status: 400 });
     }
-    if (!SAFE_REDIRECT_SCHEMES.includes(parsed.protocol.replace(":", ""))) return new Response("blocked", { status: 403 });
-    if (parsed.protocol === "https:" && isBlockedHost(parsed.hostname)) return new Response("blocked", { status: 403 });
+    if (!SAFE_REDIRECT_SCHEMES.includes(parsed.protocol.replace(":", ""))) {
+      (logger || Logger).warn("redirect_blocked", {
+        error_code: "E_SSRF_BLOCKED",
+        reason: ERROR_CODES.E_SSRF_BLOCKED.reason,
+        hints: ERROR_CODES.E_SSRF_BLOCKED.hints,
+        blocked_reason: "scheme",
+      });
+      span.end({ status: 403 });
+      return new Response("blocked", { status: 403 });
+    }
+    if (parsed.protocol === "https:" && isBlockedHost(parsed.hostname)) {
+      (logger || Logger).warn("redirect_blocked", {
+        error_code: "E_SSRF_BLOCKED",
+        reason: ERROR_CODES.E_SSRF_BLOCKED.reason,
+        hints: ERROR_CODES.E_SSRF_BLOCKED.hints,
+        blocked_reason: "blocked_host",
+        host: parsed.hostname,
+      });
+      span.end({ status: 403 });
+      return new Response("blocked", { status: 403 });
+    }
+    span.end({ status: 302 });
     return Response.redirect(parsed.toString(), 302);
   },
-  async handleVerifyDomain(request, env, url) {
+  async handleVerifyDomain(request, env, url, logger) {
+    const span = (logger || Logger).span("verify_domain");
     const domainId = url.pathname.split("/").pop();
     const token = url.searchParams.get("token");
-    if (!domainId || !token) return jsonResponse({ ok: false, error: "missing" }, 400);
-    const domain = await D1.getDomainById(env.DB, domainId);
-    if (!domain || domain.token !== token) return jsonResponse({ ok: false, error: "unauthorized" }, 403);
+    if (!domainId || !token) {
+      span.end({ status: 400 });
+      return jsonResponse({ ok: false, error: "missing" }, 400);
+    }
+    const domain = await D1.getDomainById(env.DB, domainId, logger);
+    if (!domain || domain.token !== token) {
+      span.end({ status: 403 });
+      return jsonResponse({ ok: false, error: "unauthorized" }, 403);
+    }
     const doh = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain.domain)}&type=TXT`;
-    const res = await fetch(doh, { headers: { accept: "application/dns-json" } });
+    const res = await fetchWithLogs(doh, { headers: { accept: "application/dns-json" } }, { label: "dns_query" }, logger);
     const data = await res.json();
     const answers = (data.Answer || []).map((ans) => ans.data.replace(/"/g, ""));
     const match = answers.some((value) => value.includes(token));
     if (match) {
-      await D1.updateDomainVerified(env.DB, domainId, true);
+      await D1.updateDomainVerified(env.DB, domainId, true, logger);
     }
+    span.end({ status: 200, verified: match });
     return jsonResponse({ ok: match, domain: domain.domain });
   },
-  async handleHealth(env) {
+  async handleHealth(env, logger) {
+    const span = (logger || Logger).span("health");
     let dbOk = true;
     let operators = [];
     try {
-      await env.DB.prepare("SELECT 1").first();
-      const rows = await env.DB
-        .prepare("SELECT operator_id, last_upstream_status, last_upstream_at FROM operator_settings ORDER BY last_upstream_at DESC LIMIT 5")
-        .all();
+      await dbFirst(env.DB, "health.ping", () => env.DB.prepare("SELECT 1").first(), logger);
+      const rows = await dbAll(
+        env.DB,
+        "health.operator_settings",
+        () =>
+          env.DB
+            .prepare("SELECT operator_id, last_upstream_status, last_upstream_at FROM operator_settings ORDER BY last_upstream_at DESC LIMIT 5")
+            .all(),
+        logger
+      );
       operators = rows?.results || [];
     } catch {
       dbOk = false;
@@ -2230,19 +3344,32 @@ const Router = {
       cache: { memory: SUB_CACHE.size, last_good: LAST_GOOD_MEM.size },
       last_upstream: operators,
     };
+    span.end({ status: 200, db_ok: dbOk });
     return jsonResponse(payload);
   },
-  async handleHealthFull(env) {
+  async handleHealthFull(env, logger) {
+    const span = (logger || Logger).span("health_full");
     let dbOk = true;
     let operators = [];
     let errors = [];
     try {
-      await env.DB.prepare("SELECT 1").first();
-      const rows = await env.DB
-        .prepare("SELECT operator_id, last_upstream_status, last_upstream_at FROM operator_settings ORDER BY last_upstream_at DESC LIMIT 5")
-        .all();
+      await dbFirst(env.DB, "health_full.ping", () => env.DB.prepare("SELECT 1").first(), logger);
+      const rows = await dbAll(
+        env.DB,
+        "health_full.operator_settings",
+        () =>
+          env.DB
+            .prepare("SELECT operator_id, last_upstream_status, last_upstream_at FROM operator_settings ORDER BY last_upstream_at DESC LIMIT 5")
+            .all(),
+        logger
+      );
       operators = rows?.results || [];
-      const errRows = await env.DB.prepare("SELECT event_type, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 5").all();
+      const errRows = await dbAll(
+        env.DB,
+        "health_full.audit_logs",
+        () => env.DB.prepare("SELECT event_type, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 5").all(),
+        logger
+      );
       errors = errRows?.results || [];
     } catch {
       dbOk = false;
@@ -2255,9 +3382,11 @@ const Router = {
       last_upstream: operators,
       last_errors: errors,
     };
+    span.end({ status: 200, db_ok: dbOk });
     return jsonResponse(payload);
   },
-  handleLanding(request, env) {
+  handleLanding(request, env, logger) {
+    const span = (logger || Logger).span("landing");
     const base = getBaseUrl(request, env);
     const botUsername = env.TELEGRAM_BOT_USERNAME || "";
     const html = `<!doctype html>
@@ -2409,6 +3538,7 @@ const Router = {
   <script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="${botUsername}" data-size="large" data-userpic="false" data-onauth="onTelegramAuth(user)" data-request-access="write"></script>
 </body>
 </html>`;
+    span.end({ status: 200 });
     return htmlResponse(html);
   },
 };
@@ -2423,22 +3553,19 @@ export const TestUtils = {
 
 export default {
   async fetch(request, env, ctx) {
-    try {
-      return await Router.handle(request, env, ctx);
-    } catch (err) {
-      Logger.error("Unhandled error", err);
-      return new Response("server error", { status: 500 });
-    }
+    return withRequestLogger(request, env, async (logger, requestId) => Router.handle(request, env, ctx, logger, requestId));
   },
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(D1.purgeOldRecords(env.DB, APP.purgeRetentionDays * 24 * 60 * 60 * 1000));
+    const logger = createLogger(env).child({ scope: "scheduled" });
+    ctx.waitUntil(D1.purgeOldRecords(env.DB, APP.purgeRetentionDays * 24 * 60 * 60 * 1000, logger));
     if (!env.NOTIFY_QUEUE) {
-      ctx.waitUntil(NotificationService.processPendingJobs(env));
+      ctx.waitUntil(NotificationService.processPendingJobs(env, logger));
     }
   },
   async queue(batch, env) {
+    const logger = createLogger(env).child({ scope: "queue" });
     for (const message of batch.messages) {
-      await NotificationService.processQueueMessage(env, message);
+      await NotificationService.processQueueMessage(env, message, logger);
     }
   },
 };
