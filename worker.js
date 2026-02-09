@@ -230,9 +230,16 @@ const utf8SafeEncode = (str) => {
   }
 };
 
+const normalizeBase64Input = (value) => {
+  const stripped = String(value || "").replace(/[\n\r\s]/g, "");
+  const normalized = stripped.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = normalized.length % 4 === 0 ? "" : "=".repeat(4 - (normalized.length % 4));
+  return `${normalized}${pad}`;
+};
+
 const utf8SafeDecode = (b64) => {
   try {
-    const clean = b64.replace(/[\n\r\s]/g, "");
+    const clean = normalizeBase64Input(b64);
     return new TextDecoder().decode(Uint8Array.from(atob(clean), (c) => c.charCodeAt(0)));
   } catch {
     return decodeURIComponent(escape(atob(b64)));
@@ -323,7 +330,8 @@ const parsePanelSubscriptionInput = (text) => {
       if (!/^[A-Za-z0-9_-]+$/.test(token)) return null;
       const basePath = match[1] || "";
       const base = `${parsed.protocol}//${parsed.host}${basePath}`;
-      return { token, origin: `${parsed.protocol}//${parsed.host}`, base };
+      const template = `${parsed.protocol}//${parsed.host}${basePath}/sub/{{TOKEN}}`;
+      return { token, origin: `${parsed.protocol}//${parsed.host}`, base, template };
     } catch {
       return null;
     }
@@ -357,31 +365,31 @@ const decodePanelTokenUsername = (token) => {
   }
 };
 
-const buildUpstreamSubscriptionUrl = (upstreamUrl, panelToken) => {
+const resolveUpstreamUrl = (upstreamUrl, formatHint, panelToken) => {
   if (!panelToken) return upstreamUrl;
-  let parsed;
+  if (formatHint === "template") return upstreamUrl.replace(/\{\{TOKEN\}\}/g, panelToken);
+  if (formatHint === "base") {
+    const normalized = upstreamUrl.replace(/\/$/, "");
+    return `${normalized}/sub/${panelToken}`;
+  }
+  return upstreamUrl;
+};
+
+const analyzeUpstreamBody = (body) => {
+  const trimmed = String(body || "").trim();
+  if (!trimmed) return { isBase64: false, reason: "decode_failed" };
+  if (trimmed.includes("://")) return { isBase64: false, reason: "plain" };
+  const normalized = normalizeBase64Input(trimmed);
   try {
-    parsed = new URL(upstreamUrl);
+    const decoded = new TextDecoder().decode(Uint8Array.from(atob(normalized), (c) => c.charCodeAt(0)));
+    if (decoded.includes("://")) {
+      const urlsafe = /[-_]/.test(trimmed) || trimmed.length % 4 !== 0;
+      return { isBase64: true, reason: urlsafe ? "urlsafe_base64" : "base64" };
+    }
   } catch {
-    return upstreamUrl;
+    return { isBase64: false, reason: "decode_failed" };
   }
-  const path = parsed.pathname || "/";
-  if (path.includes("/sub/")) {
-    const [prefix] = path.split("/sub/");
-    parsed.pathname = `${prefix}/sub/${panelToken}`;
-    return parsed.toString();
-  }
-  if (path.endsWith("/sub")) {
-    parsed.pathname = `${path}/${panelToken}`;
-    return parsed.toString();
-  }
-  if (path.endsWith("/sub/")) {
-    parsed.pathname = `${path}${panelToken}`;
-    return parsed.toString();
-  }
-  const normalized = path.endsWith("/") ? path.slice(0, -1) : path;
-  parsed.pathname = `${normalized}/sub/${panelToken}`;
-  return parsed.toString();
+  return { isBase64: false, reason: "decode_failed" };
 };
 
 const buildOperatorPrefixes = (options) => {
@@ -394,7 +402,7 @@ const buildOperatorPrefixes = (options) => {
 };
 
 const buildPremiumSubscriptionMessage = (payload) => {
-  const { operatorName, username, mainLink, meliLink } = payload;
+  const { operatorName, username, mainLink, meliLink, warningLine } = payload;
   let redirectBase = "";
   try {
     redirectBase = new URL(mainLink).origin;
@@ -407,7 +415,7 @@ const buildPremiumSubscriptionMessage = (payload) => {
 ${GLASS} <b>HideNet Premium</b>
 
 👤 کاربر: <b>${safeHtml(username || "Premium User")}</b>
-🔗 لینک اشتراک اصلی:
+${warningLine ? `⚠️ ${safeHtml(warningLine)}\n` : ""}🔗 لینک اشتراک اصلی:
 <code>${safeHtml(mainLink)}</code>
 ${meliLink ? `🇮🇷 لینک ملی:\n<code>${safeHtml(meliLink)}</code>\n` : ""}
 🧊 <b>اتصال فوری با یک کلیک</b>
@@ -501,7 +509,23 @@ const parseRulesArgs = (text) => {
   return patch;
 };
 
-const looksLikeBase64 = (value) => /^[A-Za-z0-9+/=\n\r]+$/.test(value.trim());
+const summarizeUpstreamFailures = (payloads) => {
+  if (!payloads?.length) return "no_upstreams";
+  if (payloads.some((item) => item.ok && item.decodeReason === "decode_failed")) return "decode_failed";
+  const errors = payloads.map((item) => item.error).filter(Boolean);
+  if (errors.some((err) => err === "timeout")) return "timeout";
+  if (errors.some((err) => err === "fetch_failed")) return "fetch_failed";
+  if (errors.some((err) => ["blocked_host", "denylisted", "not_allowlisted", "https_only", "invalid_url"].includes(err))) {
+    return "blocked_host";
+  }
+  return errors[0] || "upstream_invalid";
+};
+
+const withStatusHeaders = (headers, subStatus, upstreamStatus) => ({
+  ...headers,
+  "x-sub-status": subStatus,
+  "x-upstream-status": upstreamStatus,
+});
 
 const isValidSubscriptionText = (text) => {
   const trimmed = text.trim();
@@ -1790,7 +1814,21 @@ const SubscriptionAssembler = {
 
       if (!(upstreams?.results || []).length) {
         await D1.updateSettings(db, operatorId, { last_upstream_status: "unset", last_upstream_at: nowIso() }, logger);
-        return { body: "", headers: { ...DEFAULT_HEADERS, "x-sub-status": "upstream_unset" }, valid: false };
+        await D1.logAudit(
+          db,
+          {
+            operator_id: operatorId,
+            event_type: "upstream_unset",
+            ip: request.headers.get("cf-connecting-ip"),
+            country: request.headers.get("cf-ipcountry"),
+            user_agent: request.headers.get("user-agent"),
+            request_path: new URL(request.url).pathname,
+            response_status: 502,
+            meta_json: JSON.stringify({ reason: "no_upstreams", request_id: requestId }),
+          },
+          logger
+        );
+        return { body: "", headers: { ...DEFAULT_HEADERS }, valid: false, reason: "no_upstreams", upstreamStatus: "unset" };
       }
 
       const upstreamPayloads = await this.fetchUpstreams(env, db, upstreams?.results || [], allowlist, denylist, panelToken, logger);
@@ -1799,6 +1837,7 @@ const SubscriptionAssembler = {
 
       if (!selected.ok) {
         const hasOk = upstreamPayloads.some((item) => item.ok);
+        const reason = summarizeUpstreamFailures(upstreamPayloads);
         await D1.updateSettings(db, operatorId, { last_upstream_status: hasOk ? "invalid" : "error", last_upstream_at: nowIso() }, logger);
         await D1.logAudit(
           db,
@@ -1810,7 +1849,7 @@ const SubscriptionAssembler = {
             user_agent: request.headers.get("user-agent"),
             request_path: new URL(request.url).pathname,
             response_status: 502,
-            meta_json: JSON.stringify({ reason: "upstream_invalid", request_id: requestId }),
+            meta_json: JSON.stringify({ reason, request_id: requestId }),
           },
           logger
         );
@@ -1821,7 +1860,13 @@ const SubscriptionAssembler = {
           hints: ERROR_CODES.E_UPSTREAM_INVALID.hints,
           operator_id: operatorId,
         });
-        return { body: "", headers: { ...DEFAULT_HEADERS, "x-sub-status": "upstream_invalid" }, valid: false };
+        return {
+          body: "",
+          headers: { ...DEFAULT_HEADERS },
+          valid: false,
+          reason,
+          upstreamStatus: hasOk ? "invalid" : "error",
+        };
       }
 
       await D1.updateSettings(db, operatorId, { last_upstream_status: "ok", last_upstream_at: nowIso() }, logger);
@@ -1840,6 +1885,8 @@ const SubscriptionAssembler = {
           ...(selected.subscriptionUserinfo ? { "subscription-userinfo": selected.subscriptionUserinfo } : {}),
         },
         valid: true,
+        decodeReason: selected.decodeReason,
+        upstreamStatus: "ok",
       };
     } catch (err) {
       span.fail(err, { operator_id: operatorId, error_code: "E_INTERNAL", reason: ERROR_CODES.E_INTERNAL.reason });
@@ -1855,7 +1902,7 @@ const SubscriptionAssembler = {
         return { ok: false, status: 429, body: "", subscriptionUserinfo: null, isBase64: false, error: "cooldown", upstream };
       }
       const decryptedUrl = await decryptUpstreamUrl(env, upstream.url);
-      const requestUrl = buildUpstreamSubscriptionUrl(decryptedUrl, panelToken);
+      const requestUrl = resolveUpstreamUrl(decryptedUrl, upstream.format_hint, panelToken);
       const validation = assertSafeUpstream(requestUrl, allowlist, denylist);
       if (!validation.ok) {
         (logger || Logger).warn("upstream_blocked", {
@@ -1884,6 +1931,7 @@ const SubscriptionAssembler = {
           logger
         );
         const text = await res.text();
+        const decodeInfo = res.ok ? analyzeUpstreamBody(text) : { isBase64: false, reason: null };
         if (new TextEncoder().encode(text).length > APP.maxOutputBytes) {
           return { ok: false, status: 413, body: "", subscriptionUserinfo: null, isBase64: false, error: "too_large", upstream };
         }
@@ -1900,11 +1948,13 @@ const SubscriptionAssembler = {
           status: res.status,
           body: text,
           subscriptionUserinfo: res.headers.get("subscription-userinfo"),
-          isBase64: looksLikeBase64(text),
+          isBase64: decodeInfo.isBase64,
+          decodeReason: decodeInfo.reason,
           upstream,
         };
       } catch (err) {
         clearTimeout(timeout);
+        const isTimeout = err?.name === "AbortError";
         (logger || Logger).error("upstream_fetch_failed", err, {
           error_code: "E_UPSTREAM_FETCH",
           reason: ERROR_CODES.E_UPSTREAM_FETCH.reason,
@@ -1914,7 +1964,15 @@ const SubscriptionAssembler = {
         const nextFailure = Math.min(APP.upstreamFailureThreshold, (upstream.failure_count || 0) + 1);
         const cooldown = nextFailure >= APP.upstreamFailureThreshold ? new Date(Date.now() + APP.upstreamCooldownMs).toISOString() : null;
         await D1.bumpUpstreamFailure(db, upstream.id, nextFailure, cooldown, logger);
-        return { ok: false, status: 502, body: "", subscriptionUserinfo: null, isBase64: false, error: "fetch_failed", upstream };
+        return {
+          ok: false,
+          status: 502,
+          body: "",
+          subscriptionUserinfo: null,
+          isBase64: false,
+          error: isTimeout ? "timeout" : "fetch_failed",
+          upstream,
+        };
       }
     });
     span.end({ upstream_ok: results.filter((item) => item.ok).length });
@@ -1931,13 +1989,26 @@ const SubscriptionAssembler = {
       });
       return { ok: false, text: "", subscriptionUserinfo: null };
     }
+    const decodeReason = valid.some((item) => item.decodeReason === "urlsafe_base64")
+      ? "urlsafe_base64"
+      : valid[0]?.decodeReason || null;
     if (policy === "upstream_only") {
       const first = valid[0];
-      return { ok: true, text: this.decodeSubscription(first.body, first.isBase64), subscriptionUserinfo: first.subscriptionUserinfo };
+      return {
+        ok: true,
+        text: this.decodeSubscription(first.body, first.isBase64),
+        subscriptionUserinfo: first.subscriptionUserinfo,
+        decodeReason,
+      };
     }
     if (policy === "failover") {
       const first = valid[0];
-      return { ok: true, text: this.decodeSubscription(first.body, first.isBase64), subscriptionUserinfo: first.subscriptionUserinfo };
+      return {
+        ok: true,
+        text: this.decodeSubscription(first.body, first.isBase64),
+        subscriptionUserinfo: first.subscriptionUserinfo,
+        decodeReason,
+      };
     }
     if (policy === "round_robin") {
       const lists = valid.map((item) => this.decodeSubscription(item.body, item.isBase64).split("\n").filter(Boolean));
@@ -1948,7 +2019,7 @@ const SubscriptionAssembler = {
           if (list[i]) merged.push(list[i]);
         }
       }
-      return { ok: true, text: merged.join("\n"), subscriptionUserinfo: valid[0].subscriptionUserinfo };
+      return { ok: true, text: merged.join("\n"), subscriptionUserinfo: valid[0].subscriptionUserinfo, decodeReason };
     }
     if (policy === "weighted") {
       const weightedLists = [];
@@ -1964,10 +2035,10 @@ const SubscriptionAssembler = {
           if (list[i]) merged.push(list[i]);
         }
       }
-      return { ok: true, text: merged.join("\n"), subscriptionUserinfo: valid[0].subscriptionUserinfo };
+      return { ok: true, text: merged.join("\n"), subscriptionUserinfo: valid[0].subscriptionUserinfo, decodeReason };
     }
     const combined = valid.map((item) => this.decodeSubscription(item.body, item.isBase64)).join("\n");
-    return { ok: true, text: combined, subscriptionUserinfo: valid[0].subscriptionUserinfo };
+    return { ok: true, text: combined, subscriptionUserinfo: valid[0].subscriptionUserinfo, decodeReason };
   },
   decodeSubscription(body, isBase64) {
     if (!body) return "";
@@ -2022,7 +2093,7 @@ const testUpstreamConnection = async (env, db, operatorId, panelToken, logger) =
     }
     const targetUpstream = list[0];
     const decryptedUrl = await decryptUpstreamUrl(env, targetUpstream.url);
-    const requestUrl = buildUpstreamSubscriptionUrl(decryptedUrl, panelToken);
+    const requestUrl = resolveUpstreamUrl(decryptedUrl, targetUpstream.format_hint, panelToken);
     const allowlist = parseCommaList(settings?.upstream_allowlist);
     const denylist = parseCommaList(settings?.upstream_denylist);
     const validation = assertSafeUpstream(requestUrl, allowlist, denylist);
@@ -2049,7 +2120,9 @@ const testUpstreamConnection = async (env, db, operatorId, panelToken, logger) =
       return;
     }
     const body = await response.text();
-    if (!isValidSubscriptionText(body)) {
+    const decodeInfo = analyzeUpstreamBody(body);
+    const decoded = decodeInfo.isBase64 ? utf8SafeDecode(body) : body;
+    if (!isValidSubscriptionText(decoded)) {
       await D1.updateSettings(db, operatorId, { last_upstream_status: "invalid", last_upstream_at: nowIso() }, scopedLogger);
       return;
     }
@@ -2270,6 +2343,79 @@ const buildSnapshotResponse = (snapshot, requestId, logger) => {
   return new Response(snapshot.body_value || "", { headers });
 };
 
+const persistSnapshot = async (env, db, payload, logger) => {
+  const { operatorId, subscriptionToken, assembled, settings, rules, request, requestId } = payload;
+  const responseHeadersBase = { ...assembled.headers, "content-disposition": `inline; filename=sub_${subscriptionToken}.txt` };
+  const bodyFormat = rules?.output_format === "plain" ? "plain" : "base64";
+  const snapshot = {
+    token: subscriptionToken,
+    operator_id: operatorId,
+    body_value: assembled.body,
+    body_format: bodyFormat,
+    headers_json: JSON.stringify(responseHeadersBase),
+    updated_at: nowIso(),
+    ttl_sec: APP.snapshotTtlSec,
+    quotas_json: settings?.quotas_json || null,
+    notify_fetches: settings?.notify_fetches ?? APP.notifyFetchDefault,
+    last_fetch_notify_at: settings?.last_fetch_notify_at || null,
+    channel_id: settings?.channel_id || null,
+  };
+  setCachedSub(`sub:${subscriptionToken}`, assembled.body, responseHeadersBase, { snapshot });
+  setLastGoodMem(`sub:${subscriptionToken}`, assembled.body, responseHeadersBase, { body_format: bodyFormat });
+  await SnapshotService.setSnapshot(env, snapshot, logger);
+  await D1.upsertLastKnownGood(db, operatorId, subscriptionToken, assembled.body, bodyFormat, JSON.stringify(responseHeadersBase), logger);
+  const cacheUrl = new URL(`https://cache.internal/snap/${subscriptionToken}`);
+  const cacheHeaders = {
+    ...responseHeadersBase,
+    "cache-control": `max-age=${APP.snapshotTtlSec}`,
+    "x-snapshot-updated": snapshot.updated_at,
+    "x-snapshot-ttl": String(snapshot.ttl_sec),
+    "x-snapshot-format": snapshot.body_format,
+    "x-operator-id": snapshot.operator_id,
+    "x-snapshot-quotas": snapshot.quotas_json || "",
+    "x-snapshot-notify": String(snapshot.notify_fetches ?? APP.notifyFetchDefault),
+    "x-snapshot-last-notify": snapshot.last_fetch_notify_at || "",
+    "x-snapshot-channel": snapshot.channel_id || "",
+  };
+  await caches.default.put(cacheUrl, new Response(assembled.body, { headers: cacheHeaders, status: 200 }));
+  await D1.logAudit(
+    db,
+    {
+      operator_id: operatorId,
+      event_type: "snapshot_refresh_ok",
+      ip: request.headers.get("cf-connecting-ip"),
+      country: request.headers.get("cf-ipcountry"),
+      user_agent: request.headers.get("user-agent"),
+      request_path: new URL(request.url).pathname,
+      response_status: 200,
+      meta_json: JSON.stringify({
+        request_id: requestId,
+        ...(assembled.decodeReason === "urlsafe_base64" ? { reason: "urlsafe_base64" } : {}),
+      }),
+    },
+    logger
+  );
+  return { snapshot, responseHeadersBase, bodyFormat };
+};
+
+const assembleWithTimeout = async (promise, timeoutMs) => {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error("timeout");
+          err.name = "TimeoutError";
+          reject(err);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
 const refreshSnapshot = async (env, operatorId, subscriptionToken, panelToken, request, requestId, customerLink, logger) => {
   if (!operatorId || !subscriptionToken) return;
   const db = env.DB;
@@ -2296,52 +2442,11 @@ const refreshSnapshot = async (env, operatorId, subscriptionToken, panelToken, r
     },
     scopedLogger
   );
-  const responseHeadersBase = { ...assembled.headers, "content-disposition": `inline; filename=sub_${subscriptionToken}.txt` };
-  const bodyFormat = rules?.output_format === "plain" ? "plain" : "base64";
   if (assembled.valid) {
-    const snapshot = {
-      token: subscriptionToken,
-      operator_id: operatorId,
-      body_value: assembled.body,
-      body_format: bodyFormat,
-      headers_json: JSON.stringify(responseHeadersBase),
-      updated_at: nowIso(),
-      ttl_sec: APP.snapshotTtlSec,
-      quotas_json: settings?.quotas_json || null,
-      notify_fetches: settings?.notify_fetches ?? APP.notifyFetchDefault,
-      last_fetch_notify_at: settings?.last_fetch_notify_at || null,
-      channel_id: settings?.channel_id || null,
-    };
-    setCachedSub(`sub:${subscriptionToken}`, assembled.body, responseHeadersBase, { snapshot });
-    setLastGoodMem(`sub:${subscriptionToken}`, assembled.body, responseHeadersBase, { body_format: bodyFormat });
-    await SnapshotService.setSnapshot(env, snapshot, scopedLogger);
-    await D1.upsertLastKnownGood(db, operatorId, subscriptionToken, assembled.body, bodyFormat, JSON.stringify(responseHeadersBase), scopedLogger);
-    const cacheUrl = new URL(`https://cache.internal/snap/${subscriptionToken}`);
-    const cacheHeaders = {
-      ...responseHeadersBase,
-      "cache-control": `max-age=${APP.snapshotTtlSec}`,
-      "x-snapshot-updated": snapshot.updated_at,
-      "x-snapshot-ttl": String(snapshot.ttl_sec),
-      "x-snapshot-format": snapshot.body_format,
-      "x-operator-id": snapshot.operator_id,
-      "x-snapshot-quotas": snapshot.quotas_json || "",
-      "x-snapshot-notify": String(snapshot.notify_fetches ?? APP.notifyFetchDefault),
-      "x-snapshot-last-notify": snapshot.last_fetch_notify_at || "",
-      "x-snapshot-channel": snapshot.channel_id || "",
-    };
-    await caches.default.put(cacheUrl, new Response(assembled.body, { headers: cacheHeaders, status: 200 }));
-    await D1.logAudit(
+    await persistSnapshot(
+      env,
       db,
-      {
-        operator_id: operatorId,
-        event_type: "snapshot_refresh_ok",
-        ip: request.headers.get("cf-connecting-ip"),
-        country: request.headers.get("cf-ipcountry"),
-        user_agent: request.headers.get("user-agent"),
-        request_path: new URL(request.url).pathname,
-        response_status: 200,
-        meta_json: JSON.stringify({ request_id: requestId }),
-      },
+      { operatorId, subscriptionToken, assembled, settings, rules, request, requestId },
       scopedLogger
     );
   } else {
@@ -2355,7 +2460,7 @@ const refreshSnapshot = async (env, operatorId, subscriptionToken, panelToken, r
         user_agent: request.headers.get("user-agent"),
         request_path: new URL(request.url).pathname,
         response_status: 502,
-        meta_json: JSON.stringify({ request_id: requestId }),
+        meta_json: JSON.stringify({ request_id: requestId, reason: assembled.reason || "upstream_invalid" }),
       },
       scopedLogger
     );
@@ -2535,9 +2640,9 @@ const Telegram = {
         await D1.logAudit(
           db,
           {
-          operator_id: operator.id,
-          event_type: "settings_update:upstream_url",
-          meta_json: JSON.stringify({ upstream: redactUrlForLog(text) }),
+            operator_id: operator.id,
+            event_type: "settings_update:upstream_url",
+            meta_json: JSON.stringify({ upstream: redactUrlForLog(text) }),
           },
           logger
         );
@@ -2588,7 +2693,10 @@ const Telegram = {
         const username = decodePanelTokenUsername(panelToken);
         const upstreams = await D1.listUpstreams(db, operator.id, logger);
         const upstreamList = upstreams?.results || [];
+        const templateUrl = parsed.template;
         let origin = parsed.base || parsed.origin;
+        let upstreamUnset = !upstreamList.length;
+        let templateCreated = false;
         if (!origin && upstreamList.length) {
           try {
             const existing = await decryptUpstreamUrl(env, upstreamList[0].url);
@@ -2597,15 +2705,22 @@ const Telegram = {
             origin = null;
           }
         }
-        if (!upstreamList.length && origin) {
-          await D1.createUpstream(db, env, operator.id, { url: origin, enabled: true, weight: 1, priority: 1 }, logger);
+        if (!upstreamList.length && templateUrl) {
+          await D1.createUpstream(
+            db,
+            env,
+            operator.id,
+            { url: templateUrl, enabled: true, weight: 1, priority: 1, format_hint: "template" },
+            logger
+          );
+          templateCreated = true;
           await D1.updateSettings(db, operator.id, { last_upstream_status: "unset", last_upstream_at: nowIso() }, logger);
           await D1.logAudit(
             db,
             {
               operator_id: operator.id,
               event_type: "settings_update:upstream_auto",
-              meta_json: JSON.stringify({ upstream: redactUrlForLog(origin) }),
+              meta_json: JSON.stringify({ upstream: redactUrlForLog(templateUrl), format_hint: "template" }),
             },
             logger
           );
@@ -2632,9 +2747,19 @@ const Telegram = {
           username,
           mainLink,
           meliLink: meliLink || null,
+          warningLine: templateCreated
+            ? "آپ‌استریم تنظیم نشده بود؛ یک قالب از لینک شما ساخته شد."
+            : upstreamUnset
+              ? "آپ‌استریم تنظیم نشده است."
+              : null,
         });
         await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
         if (ctx) {
+          const requestId = crypto.randomUUID();
+          const syntheticRequest = new Request("https://telegram.local/refresh", {
+            headers: { "user-agent": "TelegramBot" },
+          });
+          ctx.waitUntil(refreshSnapshot(env, operator.id, panelToken, panelToken, syntheticRequest, requestId, null, logger));
           ctx.waitUntil(testUpstreamConnection(env, db, operator.id, panelToken, logger));
         }
         span.end({ action: "smart_paste" });
@@ -3723,7 +3848,10 @@ const Router = {
         );
       }
       span.end({ status: 200, cache: cacheSource || "snapshot" });
-      return new Response(cachedBody, { headers: { ...cachedHeaders, "x-request-id": requestId } });
+      const upstreamStatus = settings?.last_upstream_status || (snapshot ? "ok" : "unset");
+      return new Response(cachedBody, {
+        headers: withStatusHeaders({ ...cachedHeaders, "x-request-id": requestId }, "snapshot_hit", upstreamStatus),
+      });
     }
 
     if (ctx) ctx.waitUntil(refreshSnapshot(env, operatorId, subscriptionToken, panelToken, request, requestId, customerLink, operatorLogger));
@@ -3745,7 +3873,10 @@ const Router = {
         scopedLogger
       );
       span.end({ status: 200, cache: "memory_lkg" });
-      return new Response(lastGoodMem.body, { headers: { ...lastGoodMem.headers, "x-request-id": requestId } });
+      const upstreamStatus = settings?.last_upstream_status || "ok";
+      return new Response(lastGoodMem.body, {
+        headers: withStatusHeaders({ ...lastGoodMem.headers, "x-request-id": requestId }, "lkg_hit", upstreamStatus),
+      });
     }
 
     const lastGood = await SnapshotService.getLastKnownGood(env, operatorId, subscriptionToken, operatorLogger);
@@ -3770,7 +3901,91 @@ const Router = {
         operatorLogger
       );
       span.end({ status: 200, cache: "lkg" });
-      return new Response(body, { headers: { ...headersParsed, "x-request-id": requestId } });
+      const upstreamStatus = settings?.last_upstream_status || "ok";
+      return new Response(body, {
+        headers: withStatusHeaders({ ...headersParsed, "x-request-id": requestId }, "lkg_hit", upstreamStatus),
+      });
+    }
+
+    if (!snapshot) {
+      const [rules, extras, upstreams] = await Promise.all([
+        D1.getRules(db, operatorId, operatorLogger),
+        D1.listEnabledExtras(db, operatorId, operatorLogger),
+        D1.listUpstreams(db, operatorId, operatorLogger),
+      ]);
+      let failureReason = "upstream_invalid";
+      let failureUpstreamStatus = settings?.last_upstream_status || "error";
+      try {
+        const assembled = await assembleWithTimeout(
+          SubscriptionAssembler.assemble(
+            env,
+            db,
+            operatorId,
+            panelToken,
+            request,
+            requestId,
+            customerLink,
+            { settings, rules, extras, upstreams },
+            operatorLogger
+          ),
+          APP.upstreamTimeoutMs
+        );
+        if (assembled.valid) {
+          const { responseHeadersBase } = await persistSnapshot(
+            env,
+            db,
+            { operatorId, subscriptionToken, assembled, settings, rules, request, requestId },
+            operatorLogger
+          );
+          span.end({ status: 200, cache: "assembled_sync" });
+          return new Response(assembled.body, {
+            headers: withStatusHeaders(
+              { ...responseHeadersBase, "x-request-id": requestId },
+              "assembled_sync",
+              assembled.upstreamStatus || "ok"
+            ),
+          });
+        }
+        failureReason = assembled.reason || "upstream_invalid";
+        failureUpstreamStatus = assembled.upstreamStatus || failureUpstreamStatus;
+        await D1.logAudit(
+          db,
+          {
+            operator_id: operatorId,
+            event_type: "subscription_error",
+            ip,
+            country: request.headers.get("cf-ipcountry"),
+            user_agent: request.headers.get("user-agent"),
+            request_path: new URL(request.url).pathname,
+            response_status: 502,
+            meta_json: JSON.stringify({ reason: failureReason, request_id: requestId }),
+          },
+          operatorLogger
+        );
+      } catch (err) {
+        const reason = err?.name === "TimeoutError" ? "timeout" : "upstream_invalid";
+        failureReason = reason;
+        failureUpstreamStatus = reason === "timeout" ? "error" : failureUpstreamStatus;
+        await D1.logAudit(
+          db,
+          {
+            operator_id: operatorId,
+            event_type: "subscription_error",
+            ip,
+            country: request.headers.get("cf-ipcountry"),
+            user_agent: request.headers.get("user-agent"),
+            request_path: new URL(request.url).pathname,
+            response_status: 502,
+            meta_json: JSON.stringify({ reason, request_id: requestId }),
+          },
+          operatorLogger
+        );
+      }
+      span.end({ status: 200, cache: "assembled_sync_failed" });
+      return new Response(utf8SafeEncode("# upstream_invalid"), {
+        headers: withStatusHeaders({ ...DEFAULT_HEADERS, "x-request-id": requestId }, "upstream_invalid", failureUpstreamStatus),
+        status: 200,
+      });
     }
 
     if (snapshot) {
@@ -3789,7 +4004,11 @@ const Router = {
         operatorLogger
       );
       span.end({ status: 200, cache: "stale_snapshot" });
-      return buildSnapshotResponse(snapshot, requestId, operatorLogger);
+      const upstreamStatus = settings?.last_upstream_status || "ok";
+      const headers = buildSnapshotHeaders(snapshot, requestId, operatorLogger);
+      return new Response(snapshot.body_value || "", {
+        headers: withStatusHeaders(headers, "snapshot_hit", upstreamStatus),
+      });
     }
 
     await D1.logAudit(
@@ -3808,7 +4027,7 @@ const Router = {
     );
     span.end({ status: 200, cache: "none" });
     return new Response(utf8SafeEncode("# upstream_invalid"), {
-      headers: { ...DEFAULT_HEADERS, "x-request-id": requestId },
+      headers: withStatusHeaders({ ...DEFAULT_HEADERS, "x-request-id": requestId }, "upstream_invalid", settings?.last_upstream_status || "error"),
       status: 200,
     });
   },

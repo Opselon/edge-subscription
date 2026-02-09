@@ -7,6 +7,7 @@ This service is a multi-tenant subscription manager for VPN sellers/operators. I
 
 - Snapshot-based subscription delivery for massive scale
 - Multi-upstream subscription mixing + extras
+- Dynamic upstream URL templates per panel token (template/base/full modes)
 - Customer subscription links with per-link overrides
 - Telegram login + invite approval flow
 - Secure API for automation with JWT or API keys
@@ -26,11 +27,21 @@ This service is a multi-tenant subscription manager for VPN sellers/operators. I
 ### Snapshot-based `/sub` architecture
 - `/sub/:panel_token` (on verified custom domain) or `/sub/:operator_token/:panel_token` (on worker domain) serves a precomputed snapshot (KV/Cache/D1) whenever possible.
 - If the snapshot is missing or stale, the Worker returns the last-known-good response immediately and refreshes in the background.
+- If no snapshot or last-known-good exists, the Worker performs one synchronous assemble (strict timeout) and stores the snapshot so the first hit succeeds.
 - Snapshot refresh performs all upstream fetch and rule processing, then stores:
   - `body_value`, `body_format` (`plain` or `base64`)
   - headers JSON
   - `updated_at` + `ttl_sec`
   - last-known-good fallback
+
+### Upstream URL modes
+Upstreams support dynamic token substitution via `operator_upstreams.format_hint`:
+- `template`: URL contains `{{TOKEN}}` and is replaced with the panel token (e.g. `https://host/sub/{{TOKEN}}`).
+- `base`: URL is treated as a base and expanded to `/sub/{panel_token}`.
+- `full`: URL is used as-is (fixed token).
+
+### URL-safe base64 upstreams
+Upstream responses that are URL-safe base64 (`-`/`_`, missing padding) are detected, normalized, decoded, and merged when the decoded payload contains `://`.
 
 ## Data Model (D1)
 Key tables:
@@ -178,6 +189,13 @@ npm test
 ### Telegram smart paste
 - Operator pastes a panel subscription URL → bot replies with premium Persian message, branded link, and one-click buttons (no “unknown command”).
 - When no upstream is configured → upstream status shows `unset` in `/panel` and `/link`.
+- Pasted panel links auto-create a template upstream and trigger a snapshot refresh.
+
+### First-hit subscription
+- When a branded `/sub/<operator>/<panel>` link is opened without any snapshot/LKG, the Worker assembles synchronously (strict timeout) and returns merged upstream + extras immediately.
+
+### Upstream encoding
+- URL-safe base64 upstreams decode into valid subscription lines and avoid `upstream_invalid` on first fetch.
 
 ### Link routing
 - Verified domain present → subscription link uses `/sub/<PANEL_TOKEN>`.
