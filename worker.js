@@ -309,6 +309,152 @@ const getLastGoodMem = (key) => LAST_GOOD_MEM.get(key);
 
 const parseMessageText = (message) => message?.text?.trim() || "";
 
+const normalizeBaseUrl = (value) => String(value || "").trim().replace(/\/$/, "");
+
+const parsePanelSubscriptionInput = (text) => {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+    try {
+      const parsed = new URL(trimmed);
+      const match = parsed.pathname.match(/^(.*)\/sub\/([^/]+)/);
+      if (!match) return null;
+      const token = match[2];
+      if (!/^[A-Za-z0-9_-]+$/.test(token)) return null;
+      const basePath = match[1] || "";
+      const base = `${parsed.protocol}//${parsed.host}${basePath}`;
+      return { token, origin: `${parsed.protocol}//${parsed.host}`, base };
+    } catch {
+      return null;
+    }
+  }
+  if (trimmed.startsWith("/")) {
+    const match = trimmed.match(/\/sub\/([^/]+)/);
+    if (!match) return null;
+    const token = match[1];
+    if (!/^[A-Za-z0-9_-]+$/.test(token)) return null;
+    return { token, origin: null };
+  }
+  if (/^[A-Za-z0-9_-]+$/.test(trimmed)) {
+    return { token: trimmed, origin: null };
+  }
+  return null;
+};
+
+const decodePanelTokenUsername = (token) => {
+  if (!token) return "Premium User";
+  try {
+    const normalized = token.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = normalized.length % 4 === 0 ? normalized : normalized + "=".repeat(4 - (normalized.length % 4));
+    const decoded = new TextDecoder().decode(Uint8Array.from(atob(pad), (c) => c.charCodeAt(0)));
+    if (decoded.includes(",") || decoded.includes(":")) {
+      const value = decoded.split(/[,:]/)[0].trim();
+      return value || "Premium User";
+    }
+    return decoded.trim() || "Premium User";
+  } catch {
+    return "Premium User";
+  }
+};
+
+const buildUpstreamSubscriptionUrl = (upstreamUrl, panelToken) => {
+  if (!panelToken) return upstreamUrl;
+  let parsed;
+  try {
+    parsed = new URL(upstreamUrl);
+  } catch {
+    return upstreamUrl;
+  }
+  const path = parsed.pathname || "/";
+  if (path.includes("/sub/")) {
+    const [prefix] = path.split("/sub/");
+    parsed.pathname = `${prefix}/sub/${panelToken}`;
+    return parsed.toString();
+  }
+  if (path.endsWith("/sub")) {
+    parsed.pathname = `${path}/${panelToken}`;
+    return parsed.toString();
+  }
+  if (path.endsWith("/sub/")) {
+    parsed.pathname = `${path}${panelToken}`;
+    return parsed.toString();
+  }
+  const normalized = path.endsWith("/") ? path.slice(0, -1) : path;
+  parsed.pathname = `${normalized}/sub/${panelToken}`;
+  return parsed.toString();
+};
+
+const buildOperatorPrefixes = (options) => {
+  const { baseUrl, nationalBaseUrl, shareToken, domain } = options;
+  const workerBase = normalizeBaseUrl(baseUrl);
+  const nationalBase = normalizeBaseUrl(nationalBaseUrl);
+  const mainPrefix = domain ? `https://${domain}/sub/` : shareToken && workerBase ? `${workerBase}/sub/${shareToken}/` : "";
+  const meliPrefix = nationalBase ? (domain ? `${nationalBase}/sub/` : shareToken ? `${nationalBase}/sub/${shareToken}/` : "") : "";
+  return { mainPrefix, meliPrefix };
+};
+
+const buildPremiumSubscriptionMessage = (payload) => {
+  const { operatorName, username, mainLink, meliLink } = payload;
+  let redirectBase = "";
+  try {
+    redirectBase = new URL(mainLink).origin;
+  } catch {
+    redirectBase = "";
+  }
+  const label = operatorName || "Premium";
+  const targetName = label || "Premium";
+  const quickGuide = `
+${GLASS} <b>HideNet Premium</b>
+
+👤 کاربر: <b>${safeHtml(username || "Premium User")}</b>
+🔗 لینک اشتراک اصلی:
+<code>${safeHtml(mainLink)}</code>
+${meliLink ? `🇮🇷 لینک ملی:\n<code>${safeHtml(meliLink)}</code>\n` : ""}
+🧊 <b>اتصال فوری با یک کلیک</b>
+دکمه‌های پایین را بزنید تا مستقیم اضافه شود.
+
+🧭 <b>راهنمای اتصال دستی</b>
+1) اپ مورد نظر را باز کنید.
+2) گزینه Import / اضافه کردن لینک را بزنید.
+3) لینک بالا را کپی و وارد کنید.
+4) ذخیره کنید و متصل شوید.
+  `.trim();
+  const keyboard = {
+    inline_keyboard: [
+      [
+        {
+          text: GLASS_BTN("v2rayNG"),
+          url: redirectBase
+            ? `${redirectBase}/redirect?target=${encodeURIComponent(`v2rayng://install-config?url=${mainLink}#${targetName}`)}`
+            : mainLink,
+        },
+        {
+          text: GLASS_BTN("NekoBox"),
+          url: redirectBase
+            ? `${redirectBase}/redirect?target=${encodeURIComponent(`sn://subscription?url=${mainLink}&name=${targetName}`)}`
+            : mainLink,
+        },
+      ],
+      [
+        {
+          text: GLASS_BTN("Streisand"),
+          url: redirectBase
+            ? `${redirectBase}/redirect?target=${encodeURIComponent(`streisand://import/${mainLink}`)}`
+            : mainLink,
+        },
+        {
+          text: GLASS_BTN("v2Box"),
+          url: redirectBase
+            ? `${redirectBase}/redirect?target=${encodeURIComponent(`v2box://install-sub?url=${mainLink}&name=${targetName}`)}`
+            : mainLink,
+        },
+      ],
+      [{ text: GLASS_BTN("Share"), url: `https://t.me/share/url?url=${encodeURIComponent(mainLink)}` }],
+    ],
+  };
+  return { text: quickGuide, keyboard };
+};
+
 const isSnapshotFresh = (snapshot) => {
   if (!snapshot?.updated_at || !snapshot?.ttl_sec) return false;
   const updated = Date.parse(snapshot.updated_at);
@@ -1106,6 +1252,18 @@ const D1 = {
   async getDomainById(db, domainId, logger) {
     return dbFirst(db, "domains.get_by_id", () => db.prepare("SELECT * FROM domains WHERE id = ? AND deleted_at IS NULL").bind(domainId).first(), logger);
   },
+  async getDomainByHostname(db, hostname, logger) {
+    return dbFirst(
+      db,
+      "domains.get_by_hostname",
+      () =>
+        db
+          .prepare("SELECT * FROM domains WHERE domain = ? AND deleted_at IS NULL ORDER BY verified DESC, active DESC, created_at DESC LIMIT 1")
+          .bind(hostname.toLowerCase())
+          .first(),
+      logger
+    );
+  },
   async listExtraConfigs(db, operatorId, limit = 5, offset = 0, logger) {
     return dbAll(
       db,
@@ -1591,20 +1749,26 @@ const OperatorService = {
     await D1.touchOperator(db, operator.id, logger);
     return operator;
   },
-  async getShareLink(db, operator, baseUrl, logger) {
+  async getShareToken(db, operatorId, logger) {
+    const share = await D1.getPrimaryCustomerLink(db, operatorId, logger);
+    return share?.public_token || "";
+  },
+  async getBrandingInfo(db, operator, env, logger) {
     const settings = await D1.getSettings(db, operator.id, logger);
-    const share = await D1.getPrimaryCustomerLink(db, operator.id, logger);
-    let hostBase = baseUrl;
+    const shareToken = await this.getShareToken(db, operator.id, logger);
+    const baseUrl = normalizeBaseUrl(env.BASE_URL || "");
+    const nationalBaseUrl = normalizeBaseUrl(settings?.national_base_url || env.NATIONAL_BASE_URL || "");
+    let domain = null;
     if (settings?.active_domain_id) {
-      const domain = await D1.getDomainById(db, settings.active_domain_id, logger);
-      if (domain?.domain) hostBase = `https://${domain.domain}`;
+      const active = await D1.getDomainById(db, settings.active_domain_id, logger);
+      if (active?.verified) domain = active.domain;
     }
-    return `${hostBase.replace(/\/$/, "")}/sub/${share?.public_token || ""}`;
+    return { settings, shareToken, baseUrl, nationalBaseUrl, domain };
   },
 };
 
 const SubscriptionAssembler = {
-  async assemble(env, db, operatorId, token, request, requestId, customerLink, preloaded = {}, logger) {
+  async assemble(env, db, operatorId, panelToken, request, requestId, customerLink, preloaded = {}, logger) {
     const span = (logger || Logger).span("subscription_assemble", { operator_id: operatorId });
     try {
       const settings = preloaded.settings || (await D1.getSettings(db, operatorId, logger));
@@ -1614,69 +1778,75 @@ const SubscriptionAssembler = {
         operator_id: operatorId,
         context: "customer_link_overrides",
       });
-    const rules = { ...baseRules, ...overrides };
-    const extras = preloaded.extras || (await D1.listEnabledExtras(db, operatorId, logger));
-    const selectedExtras = overrides?.extras?.length
-      ? (extras?.results || []).filter((item) => overrides.extras.includes(item.id))
-      : (extras?.results || []);
+      const rules = { ...baseRules, ...overrides };
+      const extras = preloaded.extras || (await D1.listEnabledExtras(db, operatorId, logger));
+      const selectedExtras = overrides?.extras?.length
+        ? (extras?.results || []).filter((item) => overrides.extras.includes(item.id))
+        : (extras?.results || []);
 
-    const upstreams = preloaded.upstreams || (await D1.listUpstreams(db, operatorId, logger));
-    const allowlist = parseCommaList(settings?.upstream_allowlist);
-    const denylist = parseCommaList(settings?.upstream_denylist);
+      const upstreams = preloaded.upstreams || (await D1.listUpstreams(db, operatorId, logger));
+      const allowlist = parseCommaList(settings?.upstream_allowlist);
+      const denylist = parseCommaList(settings?.upstream_denylist);
 
-    const upstreamPayloads = await this.fetchUpstreams(env, db, upstreams?.results || [], allowlist, denylist, logger);
-    const selected = this.selectUpstreamsByPolicy(upstreamPayloads, rules?.merge_policy || "append", logger);
-    const extrasContent = selectedExtras.map((item) => item.content).join("\n");
+      if (!(upstreams?.results || []).length) {
+        await D1.updateSettings(db, operatorId, { last_upstream_status: "unset", last_upstream_at: nowIso() }, logger);
+        return { body: "", headers: { ...DEFAULT_HEADERS, "x-sub-status": "upstream_unset" }, valid: false };
+      }
 
-    if (!selected.ok) {
-      await D1.updateSettings(db, operatorId, { last_upstream_status: "invalid", last_upstream_at: nowIso() }, logger);
-      await D1.logAudit(
-        db,
-        {
-        operator_id: operatorId,
-        event_type: "upstream_invalid",
-        ip: request.headers.get("cf-connecting-ip"),
-        country: request.headers.get("cf-ipcountry"),
-        user_agent: request.headers.get("user-agent"),
-        request_path: new URL(request.url).pathname,
-        response_status: 502,
-        meta_json: JSON.stringify({ reason: "upstream_invalid", request_id: requestId }),
-        },
-        logger
-      );
-      await AuditService.notifyOperator(env, settings, `⚠️ آپ‌استریم نامعتبر بود برای <b>${safeHtml(settings?.branding || "اپراتور")}</b>`, logger);
-      (logger || Logger).warn("upstream_invalid", {
-        error_code: "E_UPSTREAM_INVALID",
-        reason: ERROR_CODES.E_UPSTREAM_INVALID.reason,
-        hints: ERROR_CODES.E_UPSTREAM_INVALID.hints,
-        operator_id: operatorId,
-      });
-      return { body: "", headers: { ...DEFAULT_HEADERS, "x-sub-status": "upstream_invalid" }, valid: false };
-    }
+      const upstreamPayloads = await this.fetchUpstreams(env, db, upstreams?.results || [], allowlist, denylist, panelToken, logger);
+      const selected = this.selectUpstreamsByPolicy(upstreamPayloads, rules?.merge_policy || "append", logger);
+      const extrasContent = selectedExtras.map((item) => item.content).join("\n");
 
-    await D1.updateSettings(db, operatorId, { last_upstream_status: "ok", last_upstream_at: nowIso() }, logger);
+      if (!selected.ok) {
+        const hasOk = upstreamPayloads.some((item) => item.ok);
+        await D1.updateSettings(db, operatorId, { last_upstream_status: hasOk ? "invalid" : "error", last_upstream_at: nowIso() }, logger);
+        await D1.logAudit(
+          db,
+          {
+            operator_id: operatorId,
+            event_type: "upstream_invalid",
+            ip: request.headers.get("cf-connecting-ip"),
+            country: request.headers.get("cf-ipcountry"),
+            user_agent: request.headers.get("user-agent"),
+            request_path: new URL(request.url).pathname,
+            response_status: 502,
+            meta_json: JSON.stringify({ reason: "upstream_invalid", request_id: requestId }),
+          },
+          logger
+        );
+        await AuditService.notifyOperator(env, settings, `⚠️ آپ‌استریم نامعتبر بود برای <b>${safeHtml(settings?.branding || "اپراتور")}</b>`, logger);
+        (logger || Logger).warn("upstream_invalid", {
+          error_code: "E_UPSTREAM_INVALID",
+          reason: ERROR_CODES.E_UPSTREAM_INVALID.reason,
+          hints: ERROR_CODES.E_UPSTREAM_INVALID.hints,
+          operator_id: operatorId,
+        });
+        return { body: "", headers: { ...DEFAULT_HEADERS, "x-sub-status": "upstream_invalid" }, valid: false };
+      }
 
-    const merged = this.mergeContent(selected.text, extrasContent, rules);
-    const processed = this.applyRules(merged, rules, logger);
-    const limited = limitOutput(processed.split("\n"), rules?.limit_lines || APP.maxOutputLines, rules?.limit_bytes || APP.maxOutputBytes);
-    const outputBody = limited.join("\n");
-    const formatted = rules?.output_format === "plain" ? outputBody : utf8SafeEncode(outputBody);
+      await D1.updateSettings(db, operatorId, { last_upstream_status: "ok", last_upstream_at: nowIso() }, logger);
+
+      const merged = this.mergeContent(selected.text, extrasContent, rules);
+      const processed = this.applyRules(merged, rules, logger);
+      const limited = limitOutput(processed.split("\n"), rules?.limit_lines || APP.maxOutputLines, rules?.limit_bytes || APP.maxOutputBytes);
+      const outputBody = limited.join("\n");
+      const formatted = rules?.output_format === "plain" ? outputBody : utf8SafeEncode(outputBody);
 
       span.end({ operator_id: operatorId, output_bytes: outputBody.length });
       return {
-      body: formatted,
-      headers: {
-        ...DEFAULT_HEADERS,
-        ...(selected.subscriptionUserinfo ? { "subscription-userinfo": selected.subscriptionUserinfo } : {}),
-      },
-      valid: true,
+        body: formatted,
+        headers: {
+          ...DEFAULT_HEADERS,
+          ...(selected.subscriptionUserinfo ? { "subscription-userinfo": selected.subscriptionUserinfo } : {}),
+        },
+        valid: true,
       };
     } catch (err) {
       span.fail(err, { operator_id: operatorId, error_code: "E_INTERNAL", reason: ERROR_CODES.E_INTERNAL.reason });
       throw err;
     }
   },
-  async fetchUpstreams(env, db, upstreams, allowlist, denylist, logger) {
+  async fetchUpstreams(env, db, upstreams, allowlist, denylist, panelToken, logger) {
     const span = (logger || Logger).span("upstreams_fetch", { upstream_count: upstreams.length });
     const now = Date.now();
     const results = await mapWithConcurrency(upstreams, APP.upstreamMaxConcurrency, async (upstream) => {
@@ -1685,13 +1855,14 @@ const SubscriptionAssembler = {
         return { ok: false, status: 429, body: "", subscriptionUserinfo: null, isBase64: false, error: "cooldown", upstream };
       }
       const decryptedUrl = await decryptUpstreamUrl(env, upstream.url);
-      const validation = assertSafeUpstream(decryptedUrl, allowlist, denylist);
+      const requestUrl = buildUpstreamSubscriptionUrl(decryptedUrl, panelToken);
+      const validation = assertSafeUpstream(requestUrl, allowlist, denylist);
       if (!validation.ok) {
         (logger || Logger).warn("upstream_blocked", {
           error_code: "E_SSRF_BLOCKED",
           reason: ERROR_CODES.E_SSRF_BLOCKED.reason,
           hints: ERROR_CODES.E_SSRF_BLOCKED.hints,
-          upstream: redactUrlForLog(decryptedUrl),
+          upstream: redactUrlForLog(requestUrl),
           blocked_reason: validation.error,
         });
         return { ok: false, status: 400, body: "", subscriptionUserinfo: null, isBase64: false, error: validation.error, upstream };
@@ -1706,7 +1877,7 @@ const SubscriptionAssembler = {
             })
           : { "user-agent": "v2rayNG" };
         const res = await fetchWithRedirects(
-          decryptedUrl,
+          requestUrl,
           { cf: { cacheTtl: 0 }, signal: controller.signal, headers },
           APP.maxRedirects,
           (nextUrl) => assertSafeUpstream(nextUrl, allowlist, denylist),
@@ -1837,6 +2008,56 @@ const SubscriptionAssembler = {
     (logger || Logger).debug("apply_rules_end", { output_lines: processed.length });
     return processed.join("\n");
   },
+};
+
+const testUpstreamConnection = async (env, db, operatorId, panelToken, logger) => {
+  const scopedLogger = (logger || Logger).child({ operator_id: operatorId, token_prefix: panelToken.slice(0, 6) });
+  try {
+    const settings = await D1.getSettings(db, operatorId, scopedLogger);
+    const upstreams = await D1.listUpstreams(db, operatorId, scopedLogger);
+    const list = upstreams?.results || [];
+    if (!list.length) {
+      await D1.updateSettings(db, operatorId, { last_upstream_status: "unset", last_upstream_at: nowIso() }, scopedLogger);
+      return;
+    }
+    const targetUpstream = list[0];
+    const decryptedUrl = await decryptUpstreamUrl(env, targetUpstream.url);
+    const requestUrl = buildUpstreamSubscriptionUrl(decryptedUrl, panelToken);
+    const allowlist = parseCommaList(settings?.upstream_allowlist);
+    const denylist = parseCommaList(settings?.upstream_denylist);
+    const validation = assertSafeUpstream(requestUrl, allowlist, denylist);
+    if (!validation.ok) {
+      await D1.updateSettings(db, operatorId, { last_upstream_status: "invalid", last_upstream_at: nowIso() }, scopedLogger);
+      return;
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), APP.upstreamTimeoutMs);
+    let response;
+    try {
+      response = await fetchWithRedirects(
+        requestUrl,
+        { signal: controller.signal, headers: { "user-agent": "EdgeSubscriptionBot/1.0" } },
+        APP.maxRedirects,
+        (url) => assertSafeUpstream(url, allowlist, denylist),
+        scopedLogger
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response || response.status >= 400) {
+      await D1.updateSettings(db, operatorId, { last_upstream_status: "error", last_upstream_at: nowIso() }, scopedLogger);
+      return;
+    }
+    const body = await response.text();
+    if (!isValidSubscriptionText(body)) {
+      await D1.updateSettings(db, operatorId, { last_upstream_status: "invalid", last_upstream_at: nowIso() }, scopedLogger);
+      return;
+    }
+    await D1.updateSettings(db, operatorId, { last_upstream_status: "ok", last_upstream_at: nowIso() }, scopedLogger);
+  } catch (err) {
+    (logger || Logger).warn("upstream_test_failed", { error: normalizeError(err), operator_id: operatorId });
+    await D1.updateSettings(db, operatorId, { last_upstream_status: "error", last_upstream_at: nowIso() }, scopedLogger);
+  }
 };
 
 const NotificationService = {
@@ -2049,11 +2270,9 @@ const buildSnapshotResponse = (snapshot, requestId, logger) => {
   return new Response(snapshot.body_value || "", { headers });
 };
 
-const refreshSnapshot = async (env, token, request, requestId, logger) => {
+const refreshSnapshot = async (env, operatorId, subscriptionToken, panelToken, request, requestId, customerLink, logger) => {
+  if (!operatorId || !subscriptionToken) return;
   const db = env.DB;
-  const link = await D1.getCustomerLinkByToken(db, token, logger);
-  if (!link) return;
-  const operatorId = link.operator_id;
   const scopedLogger = (logger || Logger).child({ operator_id: operatorId });
   const [settings, rules, extras, upstreams] = await Promise.all([
     D1.getSettings(db, operatorId, scopedLogger),
@@ -2065,10 +2284,10 @@ const refreshSnapshot = async (env, token, request, requestId, logger) => {
     env,
     db,
     operatorId,
-    token,
+    panelToken,
     request,
     requestId,
-    link,
+    customerLink,
     {
       settings,
       rules,
@@ -2077,11 +2296,11 @@ const refreshSnapshot = async (env, token, request, requestId, logger) => {
     },
     scopedLogger
   );
-  const responseHeadersBase = { ...assembled.headers, "content-disposition": `inline; filename=sub_${token}.txt` };
+  const responseHeadersBase = { ...assembled.headers, "content-disposition": `inline; filename=sub_${subscriptionToken}.txt` };
   const bodyFormat = rules?.output_format === "plain" ? "plain" : "base64";
   if (assembled.valid) {
     const snapshot = {
-      token,
+      token: subscriptionToken,
       operator_id: operatorId,
       body_value: assembled.body,
       body_format: bodyFormat,
@@ -2093,11 +2312,11 @@ const refreshSnapshot = async (env, token, request, requestId, logger) => {
       last_fetch_notify_at: settings?.last_fetch_notify_at || null,
       channel_id: settings?.channel_id || null,
     };
-    setCachedSub(`sub:${token}`, assembled.body, responseHeadersBase, { snapshot });
-    setLastGoodMem(`sub:${token}`, assembled.body, responseHeadersBase, { body_format: bodyFormat });
+    setCachedSub(`sub:${subscriptionToken}`, assembled.body, responseHeadersBase, { snapshot });
+    setLastGoodMem(`sub:${subscriptionToken}`, assembled.body, responseHeadersBase, { body_format: bodyFormat });
     await SnapshotService.setSnapshot(env, snapshot, scopedLogger);
-    await D1.upsertLastKnownGood(db, operatorId, token, assembled.body, bodyFormat, JSON.stringify(responseHeadersBase), scopedLogger);
-    const cacheUrl = new URL(`https://cache.internal/snap/${token}`);
+    await D1.upsertLastKnownGood(db, operatorId, subscriptionToken, assembled.body, bodyFormat, JSON.stringify(responseHeadersBase), scopedLogger);
+    const cacheUrl = new URL(`https://cache.internal/snap/${subscriptionToken}`);
     const cacheHeaders = {
       ...responseHeadersBase,
       "cache-control": `max-age=${APP.snapshotTtlSec}`,
@@ -2153,7 +2372,7 @@ const refreshSnapshot = async (env, token, request, requestId, logger) => {
 // Telegram Adapter
 // =============================
 const Telegram = {
-  async handleWebhook(request, env, logger) {
+  async handleWebhook(request, env, ctx, logger) {
     const span = (logger || Logger).span("telegram_webhook");
     if (env.TELEGRAM_SECRET) {
       const secret = request.headers.get("x-telegram-bot-api-secret-token");
@@ -2276,7 +2495,7 @@ const Telegram = {
     }
 
     if (update.message) {
-      const response = await this.handleMessage(env, db, operator, update.message, operatorLogger);
+      const response = await this.handleMessage(env, db, operator, update.message, operatorLogger, ctx);
       span.end({ status: response?.status || 200 });
       return response;
     }
@@ -2288,7 +2507,7 @@ const Telegram = {
     span.end({ status: 200 });
     return new Response("ok");
   },
-  async handleMessage(env, db, operator, message, logger) {
+  async handleMessage(env, db, operator, message, logger, ctx) {
     const scopedLogger = (logger || Logger).child({ operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
     const span = scopedLogger.span("telegram_message", { operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
     logger = scopedLogger;
@@ -2358,6 +2577,67 @@ const Telegram = {
         await AuditService.notifyOperator(env, { channel_id: text }, "✅ اتصال کانال تایید شد.", logger);
         await this.sendMessage(env, message.chat.id, "✅ کانال اطلاع‌رسانی ذخیره شد.", null, logger);
         span.end({ action: "set_channel" });
+        return new Response("ok");
+      }
+    }
+
+    if (!text.startsWith("/") && !settings?.pending_action) {
+      const parsed = parsePanelSubscriptionInput(text);
+      if (parsed?.token) {
+        const panelToken = parsed.token;
+        const username = decodePanelTokenUsername(panelToken);
+        const upstreams = await D1.listUpstreams(db, operator.id, logger);
+        const upstreamList = upstreams?.results || [];
+        let origin = parsed.base || parsed.origin;
+        if (!origin && upstreamList.length) {
+          try {
+            const existing = await decryptUpstreamUrl(env, upstreamList[0].url);
+            origin = new URL(existing).origin;
+          } catch {
+            origin = null;
+          }
+        }
+        if (!upstreamList.length && origin) {
+          await D1.createUpstream(db, env, operator.id, { url: origin, enabled: true, weight: 1, priority: 1 }, logger);
+          await D1.updateSettings(db, operator.id, { last_upstream_status: "unset", last_upstream_at: nowIso() }, logger);
+          await D1.logAudit(
+            db,
+            {
+              operator_id: operator.id,
+              event_type: "settings_update:upstream_auto",
+              meta_json: JSON.stringify({ upstream: redactUrlForLog(origin) }),
+            },
+            logger
+          );
+        } else if (!upstreamList.length) {
+          await D1.updateSettings(db, operator.id, { last_upstream_status: "unset", last_upstream_at: nowIso() }, logger);
+        }
+
+        const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
+        const prefixes = buildOperatorPrefixes({
+          baseUrl: branding.baseUrl,
+          nationalBaseUrl: branding.nationalBaseUrl,
+          shareToken: branding.shareToken,
+          domain: branding.domain,
+        });
+        if (!prefixes.mainPrefix) {
+          await this.sendMessage(env, message.chat.id, "❗️Base URL تنظیم نشده است. لطفاً BASE_URL را تنظیم کنید.", null, logger);
+          span.end({ action: "smart_paste_missing_base" });
+          return new Response("ok");
+        }
+        const mainLink = `${prefixes.mainPrefix}${panelToken}`;
+        const meliLink = prefixes.meliPrefix ? `${prefixes.meliPrefix}${panelToken}` : "";
+        const payload = buildPremiumSubscriptionMessage({
+          operatorName: operator.display_name || "Premium",
+          username,
+          mainLink,
+          meliLink: meliLink || null,
+        });
+        await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
+        if (ctx) {
+          ctx.waitUntil(testUpstreamConnection(env, db, operator.id, panelToken, logger));
+        }
+        span.end({ action: "smart_paste" });
         return new Response("ok");
       }
     }
@@ -2511,8 +2791,15 @@ const Telegram = {
         ? await D1.rotateCustomerLink(db, operator.id, primary.id, logger)
         : await D1.createCustomerLink(db, operator.id, null, null, logger);
       await D1.logAudit(db, { operator_id: operator.id, event_type: "link_rotate" }, logger);
-      const link = await OperatorService.getShareLink(db, operator, env.BASE_URL || "", logger);
-      await this.sendMessage(env, message.chat.id, `✅ لینک جدید: <code>${safeHtml(link)}</code>`, null, logger);
+      const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
+      const prefixes = buildOperatorPrefixes({
+        baseUrl: branding.baseUrl,
+        nationalBaseUrl: branding.nationalBaseUrl,
+        shareToken: share?.public_token || branding.shareToken,
+        domain: branding.domain,
+      });
+      const prefixText = prefixes.mainPrefix ? `<code>${safeHtml(prefixes.mainPrefix)}</code>` : "نامشخص";
+      await this.sendMessage(env, message.chat.id, `✅ توکن اشتراک بروزرسانی شد.\nپیشوند جدید:\n${prefixText}`, null, logger);
       span.end({ action: "rotate" });
       return new Response("ok");
     }
@@ -2706,18 +2993,26 @@ const Telegram = {
     const settings = await D1.getSettings(db, operator.id, logger);
     const domains = await D1.listDomains(db, operator.id, logger);
     const activeDomain = (domains?.results || []).find((item) => item.active);
+    const upstreams = await D1.listUpstreams(db, operator.id, logger);
     const snapshot = await D1.getLatestSnapshotInfo(db, operator.id, logger);
     const snapshotFresh = snapshot && isSnapshotFresh(snapshot) ? "تازه" : "نیازمند بروزرسانی";
-    const shareLink = await OperatorService.getShareLink(db, operator, env.BASE_URL || "", logger);
+    const shareToken = await OperatorService.getShareToken(db, operator.id, logger);
+    const prefixes = buildOperatorPrefixes({
+      baseUrl: env.BASE_URL || "",
+      shareToken,
+      domain: activeDomain?.verified ? activeDomain.domain : null,
+    });
+    const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || "unset" : "unset";
+    const upstreamAt = (upstreams?.results || []).length ? settings?.last_upstream_at || "-" : "-";
     const text = `
 ${GLASS} <b>پنل اپراتور</b>
 
 👤 اپراتور: <code>${safeHtml(operator.display_name || operator.telegram_user_id)}</code>
 🌐 دامنه فعال: <code>${safeHtml(activeDomain?.domain || "ثبت نشده")}</code>
 ✅ تایید دامنه: <code>${activeDomain?.verified ? "تایید شد" : activeDomain ? "در انتظار" : "نامشخص"}</code>
-⚡ وضعیت آپ‌استریم: <code>${safeHtml(settings?.last_upstream_status || "-")}</code> (${safeHtml(settings?.last_upstream_at || "-")})
+⚡ وضعیت آپ‌استریم: <code>${safeHtml(upstreamStatus)}</code> (${safeHtml(upstreamAt)})
 🧾 آخرین اسنپ‌شات: <code>${safeHtml(snapshot?.updated_at || "-")}</code> (${snapshotFresh})
-🔗 لینک اشتراک: <code>${safeHtml(shareLink)}</code>
+🔗 پیشوند لینک مشتری: <code>${safeHtml(prefixes.mainPrefix || "-")}</code>
 
 دستورات اصلی:
 /set_upstream لینک_پنل
@@ -2750,43 +3045,41 @@ ${GLASS} <b>پنل اپراتور</b>
     return { text, keyboard };
   },
   async buildLinkPanel(db, operator, env, logger) {
-    let baseUrl = env.BASE_URL || "";
-    const link = await OperatorService.getShareLink(db, operator, baseUrl, logger);
-    if (!baseUrl && link.startsWith("http")) {
-      baseUrl = new URL(link).origin;
-    }
     const settings = await D1.getSettings(db, operator.id, logger);
     const activeDomain = settings?.active_domain_id ? await D1.getDomainById(db, settings.active_domain_id, logger) : null;
+    const shareToken = await OperatorService.getShareToken(db, operator.id, logger);
+    const prefixes = buildOperatorPrefixes({
+      baseUrl: env.BASE_URL || "",
+      nationalBaseUrl: settings?.national_base_url || env.NATIONAL_BASE_URL || "",
+      shareToken,
+      domain: activeDomain?.verified ? activeDomain.domain : null,
+    });
+    const upstreams = await D1.listUpstreams(db, operator.id, logger);
+    const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || "unset" : "unset";
+    const upstreamAt = (upstreams?.results || []).length ? settings?.last_upstream_at || "-" : "-";
     const extrasCount = await D1.countExtraConfigs(db, operator.id, logger);
     const rules = await D1.getRules(db, operator.id, logger);
     const snapshot = await D1.getLatestSnapshotInfo(db, operator.id, logger);
     const snapshotFresh = snapshot && isSnapshotFresh(snapshot) ? "تازه" : "نیازمند بروزرسانی";
+    const prefixText = prefixes.mainPrefix || "-";
+    const sharePrefix = prefixes.mainPrefix || "";
     const text = `
-${GLASS} <b>لینک اشتراک برند شما</b>
+${GLASS} <b>پیشوند لینک اشتراک برند شما</b>
 
-<code>${safeHtml(link)}</code>
+<code>${safeHtml(prefixText)}</code>
+
+برای ساخت لینک مشتری فقط لینک پنل مشتری را ارسال کنید.
 
 دامنه فعال: ${safeHtml(activeDomain?.domain || "-")}
 تایید دامنه: ${activeDomain?.verified ? "تایید شد" : activeDomain ? "در انتظار" : "-"}
-وضعیت آپ‌استریم: ${safeHtml(settings?.last_upstream_status || "-")} (${safeHtml(settings?.last_upstream_at || "-")})
+وضعیت آپ‌استریم: ${safeHtml(upstreamStatus)} (${safeHtml(upstreamAt)})
 وضعیت اسنپ‌شات: ${safeHtml(snapshot?.updated_at || "-")} (${snapshotFresh})
 افزودنی‌ها: ${extrasCount?.count || 0}
 Merge policy: ${safeHtml(rules?.merge_policy || "append")}
     `.trim();
     const keyboard = {
       inline_keyboard: [
-        [
-          { text: GLASS_BTN("کپی لینک"), url: `https://t.me/share/url?url=${encodeURIComponent(link)}` },
-          { text: GLASS_BTN("پیش‌نمایش"), url: link },
-        ],
-        [
-          { text: GLASS_BTN("v2rayNG"), url: `${baseUrl}/redirect?target=${encodeURIComponent(`v2rayng://install-config?url=${link}#${operator.display_name || "Sub"}`)}` },
-          { text: GLASS_BTN("NekoBox"), url: `${baseUrl}/redirect?target=${encodeURIComponent(`sn://subscription?url=${link}&name=${operator.display_name || "Sub"}`)}` },
-        ],
-        [
-          { text: GLASS_BTN("Streisand"), url: `${baseUrl}/redirect?target=${encodeURIComponent(`streisand://import/${link}`)}` },
-          { text: GLASS_BTN("v2Box"), url: `${baseUrl}/redirect?target=${encodeURIComponent(`v2box://install-sub?url=${link}&name=${operator.display_name || "Sub"}`)}` },
-        ],
+        [{ text: GLASS_BTN("کپی پیشوند"), url: `https://t.me/share/url?url=${encodeURIComponent(sharePrefix)}` }],
       ],
     };
     return { text, keyboard };
@@ -2975,14 +3268,13 @@ const Router = {
     const url = new URL(request.url);
     (logger || Logger).info("router_dispatch", { route: scrubPathForLog(url.pathname) });
     if (request.method === "POST" && url.pathname === "/webhook") {
-      return Telegram.handleWebhook(request, env, logger);
+      return Telegram.handleWebhook(request, env, ctx, logger);
     }
     if (request.method === "POST" && url.pathname === "/auth/telegram") {
       return this.handleTelegramLogin(request, env, logger);
     }
     if (request.method === "GET" && url.pathname.startsWith("/sub/")) {
-      const token = url.pathname.split("/").pop();
-      return this.handleSubscription(request, env, token, ctx, logger, requestId);
+      return this.handleSubscription(request, env, url, ctx, logger, requestId);
     }
     if (request.method === "GET" && url.pathname === "/redirect") {
       return this.handleRedirect(url, logger);
@@ -3151,15 +3443,18 @@ const Router = {
     }
     if (request.method === "GET" && path === "/operators/me/status") {
       const settings = await D1.getSettings(env.DB, operator.id, apiLogger);
+      const upstreams = await D1.listUpstreams(env.DB, operator.id, apiLogger);
       const domains = await D1.listDomains(env.DB, operator.id, apiLogger);
       const activeDomain = (domains?.results || []).find((item) => item.active);
       const snapshot = await D1.getLatestSnapshotInfo(env.DB, operator.id, apiLogger);
+      const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || null : "unset";
+      const upstreamAt = (upstreams?.results || []).length ? settings?.last_upstream_at || null : null;
       span.end({ status: 200, path });
       return jsonResponse({
         ok: true,
         data: {
-          last_upstream_status: settings?.last_upstream_status || null,
-          last_upstream_at: settings?.last_upstream_at || null,
+          last_upstream_status: upstreamStatus,
+          last_upstream_at: upstreamAt,
           domain_status: activeDomain?.verified ? "verified" : activeDomain ? "pending" : "unset",
           domain_name: activeDomain?.domain || null,
           snapshot_updated_at: snapshot?.updated_at || null,
@@ -3250,12 +3545,48 @@ const Router = {
     span.end({ status: 404, path });
     return jsonResponse({ ok: false, error: "not_found" }, 404);
   },
-  async handleSubscription(request, env, token, ctx, logger, requestId) {
-    const span = (logger || Logger).span("subscription_request", { token_prefix: token.slice(0, 6) });
-    const scopedLogger = (logger || Logger).child({ token_prefix: token.slice(0, 6) });
-    const cacheKey = `sub:${token}`;
+  async handleSubscription(request, env, url, ctx, logger, requestId) {
     const db = env.DB;
-    let link = null;
+    const segments = url.pathname.split("/").filter(Boolean);
+    const rawToken = segments[2] || segments[1] || "";
+    const scopedLogger = (logger || Logger).child({ token_prefix: rawToken.slice(0, 6) });
+    let subscriptionToken = null;
+    let panelToken = null;
+    let customerLink = null;
+    let operatorId = null;
+
+    if (segments.length >= 3) {
+      const shareToken = segments[1];
+      panelToken = segments[2];
+      subscriptionToken = panelToken;
+      customerLink = await D1.getCustomerLinkByToken(db, shareToken, scopedLogger);
+      if (customerLink) operatorId = customerLink.operator_id;
+    } else if (segments.length === 2) {
+      const domain = await D1.getDomainByHostname(db, url.hostname, scopedLogger);
+      if (domain?.operator_id) {
+        operatorId = domain.operator_id;
+        panelToken = segments[1];
+        subscriptionToken = panelToken;
+      } else {
+        customerLink = await D1.getCustomerLinkByToken(db, segments[1], scopedLogger);
+        if (customerLink) {
+          operatorId = customerLink.operator_id;
+          subscriptionToken = segments[1];
+        }
+      }
+    }
+
+    if (!operatorId || !subscriptionToken) {
+      scopedLogger.warn("subscription_not_found", {
+        error_code: "E_INPUT_INVALID",
+        reason: ERROR_CODES.E_INPUT_INVALID.reason,
+        hints: ERROR_CODES.E_INPUT_INVALID.hints,
+      });
+      return new Response("not found", { status: 404 });
+    }
+
+    const span = (logger || Logger).span("subscription_request", { token_prefix: subscriptionToken.slice(0, 6) });
+    const cacheKey = `sub:${subscriptionToken}`;
     let snapshot = null;
     let cachedBody = null;
     let cachedHeaders = null;
@@ -3270,14 +3601,14 @@ const Router = {
     }
 
     if (!snapshot || !isSnapshotFresh(snapshot)) {
-      const cacheUrl = new URL(`https://cache.internal/snap/${token}`);
+      const cacheUrl = new URL(`https://cache.internal/snap/${subscriptionToken}`);
       const cache = caches.default;
       const cachedResponse = await cache.match(cacheUrl);
       if (cachedResponse) {
         const body = await cachedResponse.text();
         const headers = Object.fromEntries(cachedResponse.headers.entries());
         snapshot = {
-          token,
+          token: subscriptionToken,
           operator_id: headers["x-operator-id"],
           body_value: body,
           body_format: headers["x-snapshot-format"] || "base64",
@@ -3297,7 +3628,7 @@ const Router = {
     }
 
     if (!snapshot) {
-      snapshot = await SnapshotService.getSnapshot(env, token, scopedLogger);
+      snapshot = await SnapshotService.getSnapshot(env, subscriptionToken, scopedLogger);
       if (snapshot) {
         cachedBody = snapshot.body_value;
         cachedHeaders = buildSnapshotHeaders(snapshot, requestId, scopedLogger);
@@ -3306,19 +3637,15 @@ const Router = {
       }
     }
 
-    if (!snapshot?.operator_id) {
-      link = await D1.getCustomerLinkByToken(db, token, scopedLogger);
-      if (!link) {
-        scopedLogger.warn("subscription_not_found", {
-          error_code: "E_INPUT_INVALID",
-          reason: ERROR_CODES.E_INPUT_INVALID.reason,
-          hints: ERROR_CODES.E_INPUT_INVALID.hints,
-        });
-        span.end({ status: 404 });
-        return new Response("not found", { status: 404 });
-      }
+    if (snapshot?.operator_id && snapshot.operator_id !== operatorId) {
+      scopedLogger.warn("subscription_operator_mismatch", {
+        error_code: "E_INPUT_INVALID",
+        reason: ERROR_CODES.E_INPUT_INVALID.reason,
+        hints: ERROR_CODES.E_INPUT_INVALID.hints,
+        operator_id: operatorId,
+        snapshot_operator_id: snapshot.operator_id,
+      });
     }
-    const operatorId = snapshot?.operator_id || link.operator_id;
     const operatorLogger = scopedLogger.child({ operator_id: operatorId });
     const settings = snapshot?.quotas_json ? null : await D1.getSettings(db, operatorId, operatorLogger);
     const quotas = safeJsonParse(snapshot?.quotas_json || settings?.quotas_json, {}, operatorLogger, { error_code: "E_JSON_PARSE", context: "quotas" });
@@ -3339,14 +3666,14 @@ const Router = {
         return new Response("rate limit", { status: 429 });
       }
     }
-    if (!rateLimit(`sub-token:${token}`)) {
-      const ok = await D1.bumpRateLimit(db, `sub-token:${token}`, APP.rateLimitWindowMs, perToken, operatorLogger);
+    if (!rateLimit(`sub-token:${subscriptionToken}`)) {
+      const ok = await D1.bumpRateLimit(db, `sub-token:${subscriptionToken}`, APP.rateLimitWindowMs, perToken, operatorLogger);
       if (!ok) {
         operatorLogger.warn("subscription_rate_limited_token", {
           error_code: "E_RATE_LIMIT",
           reason: ERROR_CODES.E_RATE_LIMIT.reason,
           hints: ERROR_CODES.E_RATE_LIMIT.hints,
-          token_prefix: token.slice(0, 6),
+          token_prefix: subscriptionToken.slice(0, 6),
         });
         return new Response("rate limit", { status: 429 });
       }
@@ -3373,7 +3700,7 @@ const Router = {
           await AuditService.notifyOperator(
             env,
             settings || { operator_id: operatorId, channel_id: snapshot?.channel_id },
-            `🧊 اشتراک دریافت شد: <b>${safeHtml(token)}</b>`,
+            `🧊 اشتراک دریافت شد: <b>${safeHtml(subscriptionToken)}</b>`,
             operatorLogger
           );
           await D1.updateSettings(db, operatorId, { last_fetch_notify_at: nowIso() }, operatorLogger);
@@ -3399,7 +3726,7 @@ const Router = {
       return new Response(cachedBody, { headers: { ...cachedHeaders, "x-request-id": requestId } });
     }
 
-    if (ctx) ctx.waitUntil(refreshSnapshot(env, token, request, requestId, operatorLogger));
+    if (ctx) ctx.waitUntil(refreshSnapshot(env, operatorId, subscriptionToken, panelToken, request, requestId, customerLink, operatorLogger));
 
     const lastGoodMem = getLastGoodMem(cacheKey);
     if (lastGoodMem) {
@@ -3421,7 +3748,7 @@ const Router = {
       return new Response(lastGoodMem.body, { headers: { ...lastGoodMem.headers, "x-request-id": requestId } });
     }
 
-    const lastGood = await SnapshotService.getLastKnownGood(env, operatorId, token, operatorLogger);
+    const lastGood = await SnapshotService.getLastKnownGood(env, operatorId, subscriptionToken, operatorLogger);
     if (lastGood?.body_value) {
       const headersParsed = lastGood.headers_json
         ? safeJsonParse(lastGood.headers_json, DEFAULT_HEADERS, operatorLogger, { error_code: "E_JSON_PARSE", context: "last_known_good_headers" })
@@ -3730,15 +4057,17 @@ const Router = {
       (linksRes.data || []).forEach((link) => {
         const row = document.createElement('div');
         row.className = 'link-row';
-        const url = '${base}/sub/' + link.public_token;
+        const prefix = status.domain_status === 'verified' && status.domain_name
+          ? 'https://' + status.domain_name + '/sub/'
+          : '${base}/sub/' + link.public_token + '/';
         row.innerHTML = \`
           <div class="row">
             <span class="badge">\${link.label || 'مشتری'}</span>
             <span class="muted">\${link.enabled ? 'فعال' : 'غیرفعال'}</span>
           </div>
-          <div class="muted">\${url}</div>
+          <div class="muted">\${prefix}TOKEN</div>
           <div class="row">
-            <button class="glass-btn" data-copy="\${url}">کپی لینک</button>
+            <button class="glass-btn" data-copy="\${prefix}">کپی پیشوند</button>
             <button class="glass-btn" data-rotate="\${link.id}">چرخش لینک</button>
           </div>
         \`;

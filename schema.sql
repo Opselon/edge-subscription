@@ -15,11 +15,12 @@ CREATE TABLE IF NOT EXISTS operators (
 CREATE TABLE IF NOT EXISTS operator_settings (
   operator_id TEXT PRIMARY KEY,
   branding TEXT,
+  national_base_url TEXT,
   active_domain_id TEXT,
   channel_id TEXT,
   notify_fetches INTEGER NOT NULL DEFAULT 0 CHECK (notify_fetches IN (0,1)),
   last_fetch_notify_at TEXT,
-  last_upstream_status TEXT CHECK (last_upstream_status IN ('ok','invalid')),
+  last_upstream_status TEXT NOT NULL DEFAULT 'unset' CHECK (last_upstream_status IN ('unset','ok','invalid','error')),
   last_upstream_at TEXT,
   pending_action TEXT,
   pending_meta TEXT,
