@@ -477,7 +477,7 @@ const buildOperatorPrefixes = (options) => {
 };
 
 const buildPremiumSubscriptionMessage = (payload) => {
-  const { operatorName, username, mainLink, meliLink, warningLine } = payload;
+  const { operatorName, username, mainLink } = payload;
   let redirectBase = "";
   try {
     redirectBase = new URL(mainLink).origin;
@@ -487,12 +487,13 @@ const buildPremiumSubscriptionMessage = (payload) => {
   const label = operatorName || "Premium";
   const targetName = label || "Premium";
   const quickGuide = `
-${GLASS} <b>HideNet Premium</b>
+${GLASS} <b>Rexa Panel</b>
 
 👤 کاربر: <b>${safeHtml(username || "Premium User")}</b>
-${warningLine ? `⚠️ ${safeHtml(warningLine)}\n` : ""}🔗 لینک اشتراک اصلی:
+
+🔗 لینک اشتراک اصلی:
 <code>${safeHtml(mainLink)}</code>
-${meliLink ? `🇮🇷 لینک ملی:\n<code>${safeHtml(meliLink)}</code>\n` : ""}
+
 🧊 <b>اتصال فوری با یک کلیک</b>
 دکمه‌های پایین را بزنید تا مستقیم اضافه شود.
 
@@ -520,15 +521,15 @@ ${meliLink ? `🇮🇷 لینک ملی:\n<code>${safeHtml(meliLink)}</code>\n` :
       ],
       [
         {
-          text: GLASS_BTN("Streisand"),
-          url: redirectBase
-            ? `${redirectBase}/redirect?target=${encodeURIComponent(`streisand://import/${mainLink}`)}`
-            : mainLink,
-        },
-        {
           text: GLASS_BTN("v2Box"),
           url: redirectBase
             ? `${redirectBase}/redirect?target=${encodeURIComponent(`v2box://install-sub?url=${mainLink}&name=${targetName}`)}`
+            : mainLink,
+        },
+        {
+          text: GLASS_BTN("Streisand"),
+          url: redirectBase
+            ? `${redirectBase}/redirect?target=${encodeURIComponent(`streisand://import/${mainLink}`)}`
             : mainLink,
         },
       ],
@@ -3005,7 +3006,7 @@ const Telegram = {
     const operatorLogger = (logger || Logger).child({ operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
 
     if (update.message) {
-      const response = await this.handleMessage(env, db, operator, update.message, operatorLogger, ctx);
+      const response = await this.handleMessage(env, db, operator, update.message, operatorLogger, ctx, request);
       span.end({ status: response?.status || 200 });
       return response;
     }
@@ -3017,7 +3018,7 @@ const Telegram = {
     span.end({ status: 200 });
     return new Response("ok");
   },
-  async handleMessage(env, db, operator, message, logger, ctx) {
+  async handleMessage(env, db, operator, message, logger, ctx, request) {
     const scopedLogger = (logger || Logger).child({ operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
     const span = scopedLogger.span("telegram_message", { operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
     logger = scopedLogger;
@@ -3118,8 +3119,8 @@ const Telegram = {
         const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
         const link = branding.domain
           ? `https://${branding.domain}/sub/${customer.public_token}`
-          : `${normalizeBaseUrl(branding.baseUrl)}/sub/${branding.shareToken}/u/${customer.public_token}`;
-        const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Premium", username: customer.label || "Customer", mainLink: link, meliLink: null });
+          : `${normalizeBaseUrl(branding.baseUrl)}/sub/${branding.shareToken}/${customer.public_token}`;
+        const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Premium", username: customer.label || "Customer", mainLink: link });
         await this.sendMessage(env, message.chat.id, msg.text, msg.keyboard, logger);
         span.end({ action: "add_customer_input" });
         return new Response("ok");
@@ -3145,22 +3146,6 @@ const Telegram = {
       if (parsed?.token) {
         const panelToken = parsed.token;
         const username = decodePanelTokenUsername(panelToken);
-        const normalized = parsed.template ? normalizeUpstreamInput(parsed.template.replace("{{TOKEN}}", panelToken)) : null;
-        const upstreams = await D1.listUpstreamsAll(db, operator.id, logger);
-        const upstreamList = upstreams?.results || [];
-        let templateCreated = false;
-        if (normalized && isNormalizeOk(normalized) && (!upstreamList.length || !panelToken)) {
-          const saved = await saveNormalizedUpstream(env, db, operator.id, normalized.templateUrl, logger);
-          templateCreated = !!saved.ok;
-        } else if (normalized && isNormalizeOk(normalized) && !upstreamList.length) {
-          const saved = await saveNormalizedUpstream(env, db, operator.id, normalized.templateUrl, logger);
-          templateCreated = !!saved.ok;
-        } else if (normalized && isNormalizeOk(normalized) && upstreamList.length) {
-          const first = upstreamList[0];
-          await D1.updateUpstream(db, env, operator.id, first.id, { url: normalized.templateUrl, format_hint: "template", enabled: 1 }, logger);
-          await D1.updateSettings(db, operator.id, { last_upstream_status: "testing", last_upstream_at: nowIso() }, logger);
-        }
-
         const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
         const prefixes = buildOperatorPrefixes({
           baseUrl: branding.baseUrl,
@@ -3168,29 +3153,15 @@ const Telegram = {
           shareToken: branding.shareToken,
           domain: branding.domain,
         });
-        if (!prefixes.mainPrefix) {
-          await this.sendMessage(env, message.chat.id, "❗️Base URL تنظیم نشده است. لطفاً BASE_URL را تنظیم کنید.", null, logger);
-          span.end({ action: "smart_paste_missing_base" });
-          return new Response("ok");
-        }
-        const mainLink = `${prefixes.mainPrefix}${panelToken}`;
-        const meliLink = prefixes.meliPrefix ? `${prefixes.meliPrefix}${panelToken}` : "";
+        const workerBase = normalizeBaseUrl(branding.baseUrl || env.BASE_URL || getBaseUrl(request, env));
+        const mainPrefix = prefixes.mainPrefix || (branding.shareToken && workerBase ? `${workerBase}/sub/${branding.shareToken}/` : `${workerBase}/sub/`);
+        const mainLink = `${mainPrefix}${panelToken}`;
         const payload = buildPremiumSubscriptionMessage({
           operatorName: operator.display_name || "Premium",
           username,
           mainLink,
-          meliLink: meliLink || null,
-          warningLine: templateCreated ? "قالب آپ‌استریم از لینک شما نرمال شد." : null,
         });
         await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
-        if (ctx) {
-          const requestId = crypto.randomUUID();
-          const syntheticRequest = new Request("https://telegram.local/refresh", {
-            headers: { "user-agent": "TelegramBot" },
-          });
-          ctx.waitUntil(refreshSnapshot(env, operator.id, panelToken, panelToken, syntheticRequest, requestId, null, logger));
-          ctx.waitUntil(testUpstreamConnection(env, db, operator.id, panelToken, logger));
-        }
         span.end({ action: "smart_paste" });
         return new Response("ok");
       }
@@ -3411,8 +3382,8 @@ ${lines.join("\n") || "خالی"}`, null, logger);
       const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
       const link = branding.domain
         ? `https://${branding.domain}/sub/${customer.public_token}`
-        : `${normalizeBaseUrl(branding.baseUrl)}/sub/${branding.shareToken}/u/${customer.public_token}`;
-      const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Premium", username: customer.label || "Customer", mainLink: link, meliLink: null });
+        : `${normalizeBaseUrl(branding.baseUrl)}/sub/${branding.shareToken}/${customer.public_token}`;
+      const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Premium", username: customer.label || "Customer", mainLink: link });
       await this.sendMessage(env, message.chat.id, msg.text, msg.keyboard, logger);
       span.end({ action: "add_customer" });
       return new Response("ok");
