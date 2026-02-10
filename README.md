@@ -9,10 +9,10 @@ This service is a multi-tenant subscription manager for VPN sellers/operators. I
 - Multi-upstream subscription mixing + extras
 - Dynamic upstream URL templates per panel token (template/base/full modes)
 - Customer subscription links with per-link overrides
-- Telegram login + invite approval flow
+- **Open onboarding (no invite code required)** for Telegram bot and web login
 - Secure API for automation with JWT or API keys
-- SSRF guard + rate limiting + audit logs
-- Telegram Bot UI wizard with glass-style buttons
+- SSRF guard + DoH domain verify + rate limiting + audit logs
+- Telegram Bot UI wizard with glass-style Persian UX
 
 ## Architecture
 
@@ -23,25 +23,6 @@ This service is a multi-tenant subscription manager for VPN sellers/operators. I
 - **Queues (optional)**: notification pipeline (`NOTIFY_QUEUE`)
 - **Telegram Bot UI**: wizard for operator actions
 - **Health/Doctor**: `/health`, `/api/v1/health/full`, and `scripts/doctor.js`
-
-### Snapshot-based `/sub` architecture
-- `/sub/:panel_token` (on verified custom domain) or `/sub/:operator_token/:panel_token` (on worker domain) serves a precomputed snapshot (KV/Cache/D1) whenever possible.
-- If the snapshot is missing or stale, the Worker returns the last-known-good response immediately and refreshes in the background.
-- If no snapshot or last-known-good exists, the Worker performs one synchronous assemble (strict timeout) and stores the snapshot so the first hit succeeds.
-- Snapshot refresh performs all upstream fetch and rule processing, then stores:
-  - `body_value`, `body_format` (`plain` or `base64`)
-  - headers JSON
-  - `updated_at` + `ttl_sec`
-  - last-known-good fallback
-
-### Upstream URL modes
-Upstreams support dynamic token substitution via `operator_upstreams.format_hint`:
-- `template`: URL contains `{{TOKEN}}` and is replaced with the panel token (e.g. `https://host/sub/{{TOKEN}}`).
-- `base`: URL is treated as a base and expanded to `/sub/{panel_token}`.
-- `full`: URL is used as-is (fixed token).
-
-### URL-safe base64 upstreams
-Upstream responses that are URL-safe base64 (`-`/`_`, missing padding) are detected, normalized, decoded, and merged when the decoded payload contains `://`.
 
 ## Data Model (D1)
 Key tables:
@@ -56,9 +37,10 @@ Key tables:
 - `last_known_good`
 - `snapshots`
 - `audit_logs`
-- `invite_codes`
+- `invite_codes` (kept for optional future admin workflows; not required)
+- `app_state` (used for bot command sync timestamp)
 - `rate_limits`
-- `notify_jobs` (when Queue is not configured)
+- `notify_jobs`
 
 See `schema.sql` for full details.
 
@@ -68,135 +50,81 @@ See `schema.sql` for full details.
 - `/` renders Telegram Login Widget.
 - `/auth/telegram` validates Telegram login payload.
 - Session tokens are signed with `SESSION_SECRET`.
-- Invite codes can be supplied on login for non-admins.
+- **No invite code is required.**
 - Login sessions are stored in `localStorage` for the glassmorphism dashboard.
 
 ### API Auth
 - `Authorization: Bearer <JWT>` (from `/auth/telegram`)
 - `X-API-Key: <key>` (stored hashed)
 
-## REST API (sample)
+## Operator Onboarding
 
-### Upstreams
-- `POST /api/v1/operators/me/upstreams`
-- `GET /api/v1/operators/me/upstreams`
+### Open self-onboarding
+- Any Telegram user who sends a message is auto-created as an `active` operator.
+- Defaults are provisioned automatically:
+  - `operator_settings`
+  - `subscription_rules`
+  - default `customer_link`
 
-### Extras
-- `POST /api/v1/operators/me/extras`
+### Smart Paste
+Send panel subscription URL/token directly in bot chat:
+- Bot extracts panel token (+ best-effort username decode)
+- Generates branded link:
+  - verified domain: `https://OP_DOMAIN/sub/<PANEL_TOKEN>`
+  - worker domain: `https://WORKER/sub/<OPERATOR_SHARE_TOKEN>/<PANEL_TOKEN>`
+- Returns premium Persian message + one-click app buttons
+- Triggers snapshot refresh in background for instant usability
+- If no upstream exists and URL template is detectable, auto-creates upstream template
 
-### Customer Links
-- `POST /api/v1/operators/me/customer-links`
-- `GET /api/v1/operators/me/customer-links`
-- `POST /api/v1/operators/me/customer-links/{id}/rotate`
+## Telegram Commands
 
-### Operator Status
-- `GET /api/v1/operators/me/status`
+- `/panel` - پنل اپراتور
+- `/help` - راهنمای کامل
+- `/set_upstream` - تنظیم آپ‌استریم
+- `/set_domain` - تنظیم دامنه
+- `/verify_domain` - بررسی تایید دامنه
+- `/set_channel` - تنظیم کانال اعلان‌ها
+- `/link` - ساخت لینک مشتری / مشاهده prefix
+- `/extras` - مدیریت افزودنی‌ها
+- `/add_extra` - افزودن کانفیگ
+- `/rules` - قوانین خروجی
+- `/set_rules` - تنظیم قوانین
+- `/rotate` - ساخت لینک جدید اپراتور/مشتری
+- `/logs` - لاگ‌های اخیر
+- `/cancel` - لغو عملیات در جریان
+- `/admin_sync_commands` - آپلود مجدد دستورات ربات (admin)
 
-### Rules
-- `PATCH /api/v1/operators/me/rules`
+## Bot command sync (`setMyCommands`)
+- Worker syncs commands via Telegram `setMyCommands` and stores timestamp in `app_state.commands_synced_at`.
+- Sync is performed only if older than 7 days.
+- Force sync immediately with admin command:
+  - `/admin_sync_commands`
 
-### Health
-- `GET /api/v1/health/full`
-
-### Admin
-- `POST /api/v1/admin/invite-codes`
-- `POST /api/v1/admin/operators/{id}/approve`
-- `POST /admin/purge?days=30` (purge old audit logs + rate limits)
-
-## Merge Policies
-Supported policies in `subscription_rules.merge_policy`:
-
-- `append`
-- `round_robin`
-- `weighted`
-- `failover`
-- `upstream_only`
-- `extras_only`
-- `replace`
-
-## Operator UX
-- **Telegram bot panel (Persian)** shows:
-  - Domain verification status
-  - Upstream status and last update time
-  - Snapshot freshness
-  - Buttons for Upstreams, Customer Links, Extras, Rules, Domain Verify, Notifications
-- **Web dashboard** (after Telegram login):
-  - Stores the session token in `localStorage`
-  - Lists customer links with copy + rotate actions
-  - Shows last upstream status and domain verification
-
-## Security Highlights
+## Security & Operations Notes
 - SSRF guard: HTTPS only, private IP blocks, allow/deny list
-- Response size and line size limits
-- Rate limiting: per IP, per token, per operator
-- Redacted logging
-- API keys stored hashed
+- Rate limits: per IP, per user, per token
+- Output limits: line/size controls and sanitization
+- Domain verification via Cloudflare DoH TXT lookup
+- Snapshot + LKG fallback architecture preserved
 - Encrypted upstream URLs at rest (`ENCRYPTION_KEY` or `SESSION_SECRET`)
-- CSP + security headers on HTML pages
-
-## Operations
-
-### Doctor
-```
-npm run doctor
-```
-
-### Health
-```
-GET /health
-GET /api/v1/health/full
-```
-
-### Retention + purge
-- Scheduled handler purges audit logs and rate limit rows older than 30 days.
-- Manual purge endpoint: `POST /admin/purge?days=30`
-
-### Notifications
-- Default: `notify_fetches = 0` (only errors by default).
-- When enabled, notifications are queued and throttled using `notifyFetchIntervalMs`.
-
-## Environment Variables
-
-Required:
-- `TELEGRAM_TOKEN`
-- `ADMIN_IDS`
-- `SESSION_SECRET`
-
-Optional:
-- `TELEGRAM_SECRET`
-- `TELEGRAM_BOT_USERNAME`
-- `LOG_CHANNEL_ID`
-- `BASE_URL`
-- `NATIONAL_BASE_URL` (optional secondary base for “Meli/National” links)
-- `SNAP_KV` (KV namespace for snapshots at scale)
-- `NOTIFY_QUEUE` (Queue binding for Telegram notifications)
-- `ENCRYPTION_KEY` (optional override key for upstream URL encryption)
+- Audit logging retained for operator/admin actions
+- Optional channel notifications with queue/backoff
 
 ## Development
 
 Install dependencies:
-```
+```bash
 npm install
 ```
 
 Run tests:
-```
+```bash
 npm test
 ```
 
-## E2E Test Plan
-
-### Telegram smart paste
-- Operator pastes a panel subscription URL → bot replies with premium Persian message, branded link, and one-click buttons (no “unknown command”).
-- When no upstream is configured → upstream status shows `unset` in `/panel` and `/link`.
-- Pasted panel links auto-create a template upstream and trigger a snapshot refresh.
-
-### First-hit subscription
-- When a branded `/sub/<operator>/<panel>` link is opened without any snapshot/LKG, the Worker assembles synchronously (strict timeout) and returns merged upstream + extras immediately.
-
-### Upstream encoding
-- URL-safe base64 upstreams decode into valid subscription lines and avoid `upstream_invalid` on first fetch.
-
-### Link routing
-- Verified domain present → subscription link uses `/sub/<PANEL_TOKEN>`.
-- No verified domain → subscription link uses `/sub/<OPERATOR_TOKEN>/<PANEL_TOKEN>`.
+## E2E checklist
+1) Fresh Telegram user sends `hi` → operator auto-created active + bot hint (`/panel` or `/help`).
+2) Fresh user sends panel URL → premium smart-paste response + branded link.
+3) `/panel` shows upstream status (`unset` then `ok/invalid/error`) and snapshot state.
+4) `/help` works directly and via panel button.
+5) `setMyCommands` sync is persisted and `/admin_sync_commands` forces refresh.
