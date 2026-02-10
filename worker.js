@@ -350,16 +350,40 @@ const parsePanelSubscriptionInput = (text) => {
   return null;
 };
 
+/**
+ * @typedef {(
+ *   | { ok: false; error: string }
+ *   | {
+ *       ok: true;
+ *       templateUrl: string;
+ *       format_hint: "template";
+ *       origin?: string;
+ *       sample_token?: string;
+ *       pendingStatus?: "pending_test" | "testing";
+ *     }
+ * )} NormalizeUpstreamResult
+ */
+
+/**
+ * @param {NormalizeUpstreamResult} result
+ * @returns {result is Extract<NormalizeUpstreamResult, { ok: true }>}
+ */
+const isNormalizeOk = (result) => result.ok === true;
+
+/**
+ * @param {string} text
+ * @returns {NormalizeUpstreamResult}
+ */
 const normalizeUpstreamInput = (text) => {
   const trimmed = String(text || "").trim();
-  if (!trimmed) return { ok: false, reason: "empty" };
+  if (!trimmed) return { ok: false, error: "empty" };
   let parsed;
   try {
     parsed = new URL(trimmed);
   } catch {
-    return { ok: false, reason: "invalid_url" };
+    return { ok: false, error: "invalid_url" };
   }
-  if (parsed.protocol !== "https:") return { ok: false, reason: "https_only" };
+  if (parsed.protocol !== "https:") return { ok: false, error: "https_only" };
   const path = parsed.pathname || "/";
   const tokenMatch = path.match(/\/sub\/([^/]+)\/?$/);
   const hasTemplate = trimmed.includes("{{TOKEN}}");
@@ -368,7 +392,7 @@ const normalizeUpstreamInput = (text) => {
 
   if (hasTemplate) {
     const count = (trimmed.match(/\{\{TOKEN\}\}/g) || []).length;
-    if (count !== 1) return { ok: false, reason: "template_must_have_single_token" };
+    if (count !== 1) return { ok: false, error: "template_must_have_single_token" };
     return {
       ok: true,
       templateUrl: trimmed,
@@ -2730,9 +2754,17 @@ const assembleWithTimeout = async (promise, timeoutMs) => {
 };
 
 
+/**
+ * @param {any} env
+ * @param {any} db
+ * @param {string} operatorId
+ * @param {string} inputText
+ * @param {any} logger
+ * @returns {Promise<NormalizeUpstreamResult>}
+ */
 const saveNormalizedUpstream = async (env, db, operatorId, inputText, logger) => {
   const normalized = normalizeUpstreamInput(inputText);
-  if (!normalized.ok) return normalized;
+  if (!isNormalizeOk(normalized)) return normalized;
   const upstreams = await D1.listUpstreamsAll(db, operatorId, logger);
   const existing = (upstreams?.results || [])[0];
   if (existing) {
@@ -2746,7 +2778,7 @@ const saveNormalizedUpstream = async (env, db, operatorId, inputText, logger) =>
     ok: true,
     templateUrl: normalized.templateUrl,
     format_hint: "template",
-    sample_token: normalized.sample_token || null,
+    ...(normalized.sample_token ? { sample_token: normalized.sample_token } : {}),
     pendingStatus,
   };
 };
@@ -3003,8 +3035,8 @@ const Telegram = {
       const action = settings.pending_action;
       if (action === "set_upstream") {
         const saved = await saveNormalizedUpstream(env, db, operator.id, text, logger);
-        if (!saved.ok) {
-          await this.sendMessage(env, message.chat.id, `❗️ورودی آپ‌استریم معتبر نیست: <code>${safeHtml(saved.reason || "invalid")}</code>`, null, logger);
+        if (!isNormalizeOk(saved)) {
+          await this.sendMessage(env, message.chat.id, `❗️ورودی آپ‌استریم معتبر نیست: <code>${safeHtml(saved.error || "invalid")}</code>`, null, logger);
           span.end({ action: "set_upstream_invalid" });
           return new Response("ok");
         }
@@ -3079,7 +3111,7 @@ const Telegram = {
         }
         if (parsed.template) {
           const normalized = normalizeUpstreamInput(parsed.template.replace("{{TOKEN}}", parsed.token));
-          if (normalized.ok) await saveNormalizedUpstream(env, db, operator.id, normalized.templateUrl, logger);
+          if (isNormalizeOk(normalized)) await saveNormalizedUpstream(env, db, operator.id, normalized.templateUrl, logger);
         }
         await D1.setPendingAction(db, operator.id, null, null, logger);
         await D1.logAudit(db, { operator_id: operator.id, event_type: "customer_create", meta_json: JSON.stringify({ customer_id: customer.id }) }, logger);
@@ -3117,13 +3149,13 @@ const Telegram = {
         const upstreams = await D1.listUpstreamsAll(db, operator.id, logger);
         const upstreamList = upstreams?.results || [];
         let templateCreated = false;
-        if (normalized?.ok && (!upstreamList.length || !panelToken)) {
+        if (normalized && isNormalizeOk(normalized) && (!upstreamList.length || !panelToken)) {
           const saved = await saveNormalizedUpstream(env, db, operator.id, normalized.templateUrl, logger);
           templateCreated = !!saved.ok;
-        } else if (normalized?.ok && !upstreamList.length) {
+        } else if (normalized && isNormalizeOk(normalized) && !upstreamList.length) {
           const saved = await saveNormalizedUpstream(env, db, operator.id, normalized.templateUrl, logger);
           templateCreated = !!saved.ok;
-        } else if (normalized?.ok && upstreamList.length) {
+        } else if (normalized && isNormalizeOk(normalized) && upstreamList.length) {
           const first = upstreamList[0];
           await D1.updateUpstream(db, env, operator.id, first.id, { url: normalized.templateUrl, format_hint: "template", enabled: 1 }, logger);
           await D1.updateSettings(db, operator.id, { last_upstream_status: "testing", last_upstream_at: nowIso() }, logger);
@@ -3198,8 +3230,8 @@ const Telegram = {
         return new Response("ok");
       }
       const saved = await saveNormalizedUpstream(env, db, operator.id, value, logger);
-      if (!saved.ok) {
-        await this.sendMessage(env, message.chat.id, `❗️ورودی آپ‌استریم معتبر نیست: <code>${safeHtml(saved.reason || "invalid")}</code>`, null, logger);
+      if (!isNormalizeOk(saved)) {
+        await this.sendMessage(env, message.chat.id, `❗️ورودی آپ‌استریم معتبر نیست: <code>${safeHtml(saved.error || "invalid")}</code>`, null, logger);
         span.end({ action: "set_upstream_invalid" });
         return new Response("ok");
       }
