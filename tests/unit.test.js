@@ -11,6 +11,7 @@ const {
   resolveOperatorBaseUrl,
   buildOperatorScopedSubLink,
   buildPremiumSubscriptionMessage,
+  createTelegramSendMessageBody,
 } = TestUtils;
 
 describe("unit: sanitization and dedupe", () => {
@@ -120,5 +121,33 @@ describe("unit: smart paste link mapping", () => {
     assert.match(payload.text, /🧭 راهنمای اتصال دستی/);
     const labels = payload.keyboard.inline_keyboard.flat().map((btn) => btn.text);
     assert.deepEqual(labels, ["v2rayNG", "NekoBox", "v2Box", "Streisand", "Share"]);
+  });
+});
+
+describe("unit: telegram keyboard sanitization", () => {
+  it("sanitizes bad button and keeps valid buttons for send", () => {
+    const { body, sanitizeResult } = createTelegramSendMessageBody(123, "hello", {
+      inline_keyboard: [
+        [
+          { text: "Broken" },
+          { text: "Valid", callback_data: "do_something" },
+        ],
+      ],
+    });
+    assert.equal(sanitizeResult.removedCount, 1);
+    assert.deepEqual(sanitizeResult.removedReasons, { missing_url_and_callback_data: 1 });
+    assert.deepEqual(body.reply_markup, {
+      inline_keyboard: [[{ text: "Valid", callback_data: "do_something" }]],
+    });
+    assert.equal(body.parse_mode, "HTML");
+  });
+
+  it("drops reply_markup when all buttons are invalid", () => {
+    const { body, sanitizeResult } = createTelegramSendMessageBody(123, "hello", {
+      inline_keyboard: [[{ text: "Broken" }, { text: 1, callback_data: "x" }]],
+    });
+    assert.equal(sanitizeResult.removedCount, 2);
+    assert.equal(sanitizeResult.keyboard, null);
+    assert.equal("reply_markup" in body, false);
   });
 });
