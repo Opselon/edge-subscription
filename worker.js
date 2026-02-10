@@ -23,6 +23,7 @@ const APP = {
   maxRedirects: 2,
   sessionTtlSec: 60 * 60 * 24,
   snapshotTtlSec: 300,
+  commandSyncIntervalMs: 7 * 24 * 60 * 60 * 1000,
   auditSampleRate: 0.01,
   upstreamMaxConcurrency: 3,
   upstreamFailureThreshold: 3,
@@ -1135,7 +1136,7 @@ const D1 = {
   async listOperators(db, logger) {
     return dbAll(db, "operators.list", () => db.prepare("SELECT * FROM operators ORDER BY created_at DESC").all(), logger);
   },
-  async createOperator(db, telegramUserId, displayName, role = "operator", status = "pending", logger) {
+  async createOperator(db, telegramUserId, displayName, role = "operator", status = "active", logger) {
     const id = crypto.randomUUID();
     await dbRun(
       db,
@@ -1178,6 +1179,18 @@ const D1 = {
       db,
       "operators.update_status",
       () => db.prepare("UPDATE operators SET status = ?, updated_at = ? WHERE id = ?").bind(status, nowIso(), operatorId).run(),
+      logger
+    );
+  },
+  async updateOperatorProfile(db, operatorId, patch, logger) {
+    const fields = Object.keys(patch || {});
+    if (!fields.length) return;
+    const setClause = fields.map((field) => `${field} = ?`).join(", ");
+    const values = fields.map((field) => patch[field]);
+    await dbRun(
+      db,
+      "operators.update_profile",
+      () => db.prepare(`UPDATE operators SET ${setClause}, updated_at = ? WHERE id = ?`).bind(...values, nowIso(), operatorId).run(),
       logger
     );
   },
@@ -1689,6 +1702,24 @@ const D1 = {
       logger
     );
   },
+  async getAppState(db, key, logger) {
+    return dbFirst(db, "app_state.get", () => db.prepare("SELECT * FROM app_state WHERE key = ?").bind(key).first(), logger);
+  },
+  async setAppState(db, key, value, logger) {
+    const now = nowIso();
+    await dbRun(
+      db,
+      "app_state.upsert",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO app_state (key, value, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+          )
+          .bind(key, value, now, now)
+          .run(),
+      logger
+    );
+  },
   async logAudit(db, payload, logger) {
     const id = crypto.randomUUID();
     await dbRun(
@@ -1758,18 +1789,26 @@ const D1 = {
 const OperatorService = {
   async ensureOperator(db, telegramUser, env, logger) {
     let operator = await D1.getOperatorByTelegramId(db, telegramUser.id, logger);
-    if (!operator && isAdmin(telegramUser.id, env)) {
+    const displayName = telegramUser.first_name || telegramUser.username || "Operator";
+    if (!operator) {
       operator = await D1.createOperator(
         db,
         telegramUser.id,
-        telegramUser.first_name || telegramUser.username,
-        "admin",
+        displayName,
+        isAdmin(telegramUser.id, env) ? "admin" : "operator",
         "active",
         logger
       );
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "operator_auto_onboard" }, logger);
+    } else {
+      const patch = {};
+      if (!operator.display_name && displayName) patch.display_name = displayName;
+      if (operator.status !== "active") patch.status = "active";
+      if (Object.keys(patch).length) {
+        await D1.updateOperatorProfile(db, operator.id, patch, logger);
+        operator = { ...operator, ...patch };
+      }
     }
-    if (!operator) return null;
-    if (operator.status !== "active") return operator;
     await D1.touchOperator(db, operator.id, logger);
     return operator;
   },
@@ -2473,6 +2512,41 @@ const refreshSnapshot = async (env, operatorId, subscriptionToken, panelToken, r
   }
 };
 
+
+const TELEGRAM_COMMANDS = [
+  { command: "panel", description: "پنل اپراتور" },
+  { command: "help", description: "راهنمای کامل" },
+  { command: "set_upstream", description: "تنظیم آپ‌استریم" },
+  { command: "set_domain", description: "تنظیم دامنه" },
+  { command: "verify_domain", description: "بررسی تایید دامنه" },
+  { command: "set_channel", description: "تنظیم کانال اعلان‌ها" },
+  { command: "link", description: "ساخت لینک مشتری / مشاهده prefix" },
+  { command: "extras", description: "مدیریت افزودنی‌ها" },
+  { command: "add_extra", description: "افزودن کانفیگ" },
+  { command: "rules", description: "قوانین خروجی" },
+  { command: "set_rules", description: "تنظیم قوانین" },
+  { command: "rotate", description: "ساخت لینک جدید اپراتور/مشتری" },
+  { command: "logs", description: "لاگ‌های اخیر" },
+  { command: "cancel", description: "لغو عملیات در جریان" },
+  { command: "admin_sync_commands", description: "آپلود مجدد دستورات ربات" },
+];
+
+const syncTelegramCommands = async (env, db, logger, force = false) => {
+  if (!env?.TELEGRAM_TOKEN || !db) return { ok: false, skipped: true, reason: "missing_telegram_or_db" };
+  if (!force) {
+    const state = await D1.getAppState(db, "commands_synced_at", logger);
+    const at = Number(state?.value || 0);
+    if (Number.isFinite(at) && at > 0 && Date.now() - at < APP.commandSyncIntervalMs) {
+      return { ok: true, skipped: true, reason: "fresh" };
+    }
+  }
+  const result = await telegramFetch("setMyCommands", { commands: TELEGRAM_COMMANDS }, { env, logger, label: "telegram_set_my_commands" });
+  if (result.ok) {
+    await D1.setAppState(db, "commands_synced_at", String(Date.now()), logger);
+  }
+  return result;
+};
+
 // =============================
 // Telegram Adapter
 // =============================
@@ -2571,33 +2645,9 @@ const Telegram = {
     const db = env.DB;
     const text = update.message ? parseMessageText(update.message) : "";
     const operator = await OperatorService.ensureOperator(db, user, env, logger);
-    if (!operator) {
-      if (update.message && text.startsWith("/invite")) {
-        const response = await this.handleInvite(env, db, user, text, logger);
-        span.end({ status: response?.status || 200, action: "invite" });
-        return response;
-      }
-      if (update.message && text.startsWith("/start")) {
-        const payload = this.buildOnboardingMessage(env);
-        await this.sendMessage(env, user.id, payload.text, payload.keyboard, logger, {
-          telegram_user_id: user.id,
-        });
-        span.end({ status: 200, action: "onboarding" });
-        return new Response("ok");
-      }
-      await this.sendMessage(env, user.id, "⚠️ این ربات فقط برای اپراتورها فعال است.", null, logger, {
-        telegram_user_id: user.id,
-      });
-      span.end({ status: 200 });
-      return new Response("ok");
-    }
+    await syncTelegramCommands(env, db, logger, false);
 
     const operatorLogger = (logger || Logger).child({ operator_id: operator.id, telegram_user_id: operator.telegram_user_id });
-    if (operator.status === "pending") {
-      await this.sendMessage(env, user.id, "⏳ حساب شما در انتظار تایید مدیر است.", null, operatorLogger);
-      span.end({ status: 200 });
-      return new Response("ok");
-    }
 
     if (update.message) {
       const response = await this.handleMessage(env, db, operator, update.message, operatorLogger, ctx);
@@ -2618,12 +2668,6 @@ const Telegram = {
     logger = scopedLogger;
     const text = parseMessageText(message);
     const settings = await D1.getSettings(db, operator.id, logger);
-
-    if (text.startsWith("/invite")) {
-      const response = await this.handleInvite(env, db, message.from, text, logger, operator);
-      span.end({ action: "invite" });
-      return response;
-    }
 
     if (text === "/cancel") {
       await D1.setPendingAction(db, operator.id, null, null, logger);
@@ -2647,7 +2691,7 @@ const Telegram = {
           logger
         );
         await AuditService.notifyOperator(env, settings, "🧊 آپ‌استریم بروزرسانی شد.", logger);
-        await this.sendMessage(env, message.chat.id, "✅ لینک آپ‌استریم ذخیره شد.", null, logger);
+        await this.sendMessage(env, message.chat.id, `${GLASS} ✅ لینک آپ‌استریم ذخیره شد.\nاقدام بعدی: /panel`, null, logger);
         span.end({ action: "set_upstream" });
         return new Response("ok");
       }
@@ -2671,7 +2715,7 @@ const Telegram = {
         await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:domain" }, logger);
         await AuditService.notifyOperator(env, settings, "🧊 دامنه بروزرسانی شد.", logger);
         const token = latest?.token ? `\nتوکن تایید: <code>${safeHtml(latest.token)}</code>` : "";
-        await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد.${token}`, null, logger);
+        await this.sendMessage(env, message.chat.id, `${GLASS} ✅ دامنه ثبت شد.${token}\nاقدام بعدی: /verify_domain`, null, logger);
         span.end({ action: "set_domain" });
         return new Response("ok");
       }
@@ -2680,7 +2724,7 @@ const Telegram = {
         await D1.setPendingAction(db, operator.id, null, null, logger);
         await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:channel" }, logger);
         await AuditService.notifyOperator(env, { channel_id: text }, "✅ اتصال کانال تایید شد.", logger);
-        await this.sendMessage(env, message.chat.id, "✅ کانال اطلاع‌رسانی ذخیره شد.", null, logger);
+        await this.sendMessage(env, message.chat.id, `${GLASS} ✅ کانال اطلاع‌رسانی ذخیره شد.`, null, logger);
         span.end({ action: "set_channel" });
         return new Response("ok");
       }
@@ -2765,6 +2809,16 @@ const Telegram = {
         span.end({ action: "smart_paste" });
         return new Response("ok");
       }
+      await this.sendMessage(
+        env,
+        message.chat.id,
+        `${GLASS} برای شروع /panel یا /help
+فقط لینک پنل مشتری را بفرست تا تبدیل هوشمند انجام شود.`,
+        { inline_keyboard: [[{ text: GLASS_BTN("پنل"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_panel" })) }, { text: GLASS_BTN("راهنما"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_help" })) }]] },
+        logger
+      );
+      span.end({ action: "text_hint" });
+      return new Response("ok");
     }
 
     if (text.startsWith("/start") || text.startsWith("/panel")) {
@@ -2773,11 +2827,17 @@ const Telegram = {
       span.end({ action: "panel" });
       return new Response("ok");
     }
+    if (text.startsWith("/help")) {
+      const payload = this.buildHelpMessage();
+      await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
+      span.end({ action: "help" });
+      return new Response("ok");
+    }
     if (text.startsWith("/set_upstream")) {
       const value = text.replace("/set_upstream", "").trim();
       if (!value) {
         await D1.setPendingAction(db, operator.id, "set_upstream", null, logger);
-        await this.sendMessage(env, message.chat.id, "📌 لطفاً لینک آپ‌استریم را بفرستید.", null, logger);
+        await this.sendMessage(env, message.chat.id, `${GLASS} Wizard آپ‌استریم\n📌 لطفاً لینک آپ‌استریم را بفرستید.`, null, logger);
         span.end({ action: "set_upstream_prompt" });
         return new Response("ok");
       }
@@ -2792,7 +2852,7 @@ const Telegram = {
         logger
       );
       await AuditService.notifyOperator(env, settings, "🧊 آپ‌استریم بروزرسانی شد.", logger);
-      await this.sendMessage(env, message.chat.id, "✅ لینک آپ‌استریم ذخیره شد.", null, logger);
+      await this.sendMessage(env, message.chat.id, `${GLASS} ✅ لینک آپ‌استریم ذخیره شد.\nاقدام بعدی: /panel`, null, logger);
       span.end({ action: "set_upstream" });
       return new Response("ok");
     }
@@ -2800,7 +2860,7 @@ const Telegram = {
       const domain = text.replace("/set_domain", "").trim();
       if (!domain) {
         await D1.setPendingAction(db, operator.id, "set_domain", null, logger);
-        await this.sendMessage(env, message.chat.id, "📌 لطفاً دامنه را بفرستید.", null, logger);
+        await this.sendMessage(env, message.chat.id, `${GLASS} Wizard دامنه\n📌 لطفاً دامنه را بفرستید.`, null, logger);
         span.end({ action: "set_domain_prompt" });
         return new Response("ok");
       }
@@ -2826,22 +2886,44 @@ const Telegram = {
       );
       await AuditService.notifyOperator(env, settings, "🧊 دامنه بروزرسانی شد.", logger);
       const token = latest?.token ? `\nتوکن تایید: <code>${safeHtml(latest.token)}</code>` : "";
-      await this.sendMessage(env, message.chat.id, `✅ دامنه ثبت شد.${token}`, null, logger);
+      await this.sendMessage(env, message.chat.id, `${GLASS} ✅ دامنه ثبت شد.${token}\nاقدام بعدی: /verify_domain`, null, logger);
       span.end({ action: "set_domain" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/verify_domain")) {
+      const domains = await D1.listDomains(db, operator.id, logger);
+      const targetDomain = (domains?.results || []).find((item) => item.active) || (domains?.results || [])[0];
+      if (!targetDomain?.token) {
+        await this.sendMessage(env, message.chat.id, "❓ دامنه‌ای برای بررسی وجود ندارد. ابتدا /set_domain را انجام دهید.", null, logger);
+        span.end({ action: "verify_domain_missing" });
+        return new Response("ok");
+      }
+      const doh = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(targetDomain.domain)}&type=TXT`;
+      const res = await fetchWithLogs(doh, { headers: { accept: "application/dns-json" } }, { label: "dns_query" }, logger);
+      const data = await res.json();
+      const answers = (data.Answer || []).map((ans) => ans.data.replace(/"/g, ""));
+      const match = answers.some((value) => value.includes(targetDomain.token));
+      if (match) {
+        await D1.updateDomainVerified(db, targetDomain.id, true, logger);
+        await this.sendMessage(env, message.chat.id, `✅ دامنه <code>${safeHtml(targetDomain.domain)}</code> تایید شد.`, null, logger);
+      } else {
+        await this.sendMessage(env, message.chat.id, "⛔ رکورد TXT هنوز پیدا نشد. چند دقیقه بعد دوباره /verify_domain را بزنید.", null, logger);
+      }
+      span.end({ action: "verify_domain", ok: match });
       return new Response("ok");
     }
     if (text.startsWith("/set_channel")) {
       const channelId = text.replace("/set_channel", "").trim();
       if (!channelId) {
         await D1.setPendingAction(db, operator.id, "set_channel", null, logger);
-        await this.sendMessage(env, message.chat.id, "📌 لطفاً شناسه کانال را بفرستید.", null, logger);
+        await this.sendMessage(env, message.chat.id, `${GLASS} Wizard کانال\n📌 لطفاً شناسه کانال را بفرستید.`, null, logger);
         span.end({ action: "set_channel_prompt" });
         return new Response("ok");
       }
       await D1.updateSettings(db, operator.id, { channel_id: channelId }, logger);
       await D1.logAudit(db, { operator_id: operator.id, event_type: "settings_update:channel" }, logger);
       await AuditService.notifyOperator(env, { channel_id: channelId }, "✅ اتصال کانال تایید شد.", logger);
-      await this.sendMessage(env, message.chat.id, "✅ کانال اطلاع‌رسانی ذخیره شد.", null, logger);
+      await this.sendMessage(env, message.chat.id, `${GLASS} ✅ کانال اطلاع‌رسانی ذخیره شد.`, null, logger);
       span.end({ action: "set_channel" });
       return new Response("ok");
     }
@@ -3010,6 +3092,17 @@ const Telegram = {
       span.end({ action: "admin_broadcast" });
       return new Response("ok");
     }
+    if (text.startsWith("/admin_sync_commands")) {
+      if (!isAdmin(operator.telegram_user_id, env)) {
+        await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.", null, logger);
+        span.end({ action: "admin_sync_commands_forbidden" });
+        return new Response("ok");
+      }
+      const syncResult = await syncTelegramCommands(env, db, logger, true);
+      await this.sendMessage(env, message.chat.id, syncResult.ok ? "✅ دستورات ربات با موفقیت آپلود شد." : "❗️آپلود دستورات ناموفق بود.", null, logger);
+      span.end({ action: "admin_sync_commands", ok: syncResult.ok });
+      return new Response("ok");
+    }
     if (text.startsWith("/admin_health_telegram")) {
       if (!isAdmin(operator.telegram_user_id, env)) {
         await this.sendMessage(env, message.chat.id, "⚠️ این بخش فقط برای مدیر است.", null, logger);
@@ -3035,8 +3128,14 @@ const Telegram = {
       return new Response("ok");
     }
 
-    await this.sendMessage(env, message.chat.id, "❓ دستور ناشناخته. /panel را بزنید.", null, logger);
-    span.end({ action: "unknown_command" });
+    await this.sendMessage(
+      env,
+      message.chat.id,
+      `${GLASS} برای شروع /panel یا /help`,
+      { inline_keyboard: [[{ text: GLASS_BTN("پنل"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_panel" })) }, { text: GLASS_BTN("راهنما"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_help" })) }]] },
+      logger
+    );
+    span.end({ action: "command_hint" });
     return new Response("ok");
   },
   async handleCallback(env, db, operator, callback, logger) {
@@ -3087,19 +3186,36 @@ const Telegram = {
     }
     if (action === "panel_channel") {
       await D1.setPendingAction(db, operator.id, "set_channel", null, logger);
-      await this.sendMessage(env, chatId, "📌 شناسه کانال را ارسال کنید.", null, logger);
+      await this.sendMessage(env, chatId, `${GLASS} Wizard کانال
+📌 شناسه کانال را ارسال کنید.
+نمونه: <code>-1001234567890</code>`, null, logger);
       span.end({ action: "panel_channel" });
+      return new Response("ok");
+    }
+    if (action === "show_help") {
+      const payload = this.buildHelpMessage();
+      await this.sendMessage(env, chatId, payload.text, payload.keyboard, logger);
+      span.end({ action: "show_help" });
+      return new Response("ok");
+    }
+    if (action === "show_panel") {
+      const payload = await this.buildPanel(db, operator, env, logger);
+      await this.sendMessage(env, chatId, payload.text, payload.keyboard, logger);
+      span.end({ action: "show_panel" });
       return new Response("ok");
     }
     if (action === "panel_upstream") {
       await D1.setPendingAction(db, operator.id, "set_upstream", null, logger);
-      await this.sendMessage(env, chatId, "📌 لینک آپ‌استریم را ارسال کنید.", null, logger);
+      await this.sendMessage(env, chatId, `${GLASS} Wizard آپ‌استریم
+📌 لینک پنل/آپ‌استریم را ارسال کنید.`, null, logger);
       span.end({ action: "panel_upstream" });
       return new Response("ok");
     }
     if (action === "panel_domain") {
       await D1.setPendingAction(db, operator.id, "set_domain", null, logger);
-      await this.sendMessage(env, chatId, "📌 دامنه را ارسال کنید.", null, logger);
+      await this.sendMessage(env, chatId, `${GLASS} Wizard دامنه
+📌 دامنه را ارسال کنید.
+نمونه: <code>sub.example.com</code>`, null, logger);
       span.end({ action: "panel_domain" });
       return new Response("ok");
     }
@@ -3120,7 +3236,7 @@ const Telegram = {
     const activeDomain = (domains?.results || []).find((item) => item.active);
     const upstreams = await D1.listUpstreams(db, operator.id, logger);
     const snapshot = await D1.getLatestSnapshotInfo(db, operator.id, logger);
-    const snapshotFresh = snapshot && isSnapshotFresh(snapshot) ? "تازه" : "نیازمند بروزرسانی";
+    const snapshotFresh = !snapshot ? "none" : isSnapshotFresh(snapshot) ? "fresh" : "stale";
     const shareToken = await OperatorService.getShareToken(db, operator.id, logger);
     const prefixes = buildOperatorPrefixes({
       baseUrl: env.BASE_URL || "",
@@ -3129,42 +3245,41 @@ const Telegram = {
     });
     const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || "unset" : "unset";
     const upstreamAt = (upstreams?.results || []).length ? settings?.last_upstream_at || "-" : "-";
+    const domainStatusIcon = activeDomain?.verified ? "✅" : activeDomain ? "⛔" : "❓";
+    const snapshotIcon = snapshotFresh === "fresh" ? "✅" : snapshotFresh === "stale" ? "⛔" : "❓";
     const text = `
-${GLASS} <b>پنل اپراتور</b>
+${GLASS} <b>پنل اپراتور پریمیوم</b>
 
-👤 اپراتور: <code>${safeHtml(operator.display_name || operator.telegram_user_id)}</code>
+👤 نام اپراتور: <code>${safeHtml(operator.display_name || operator.telegram_user_id)}</code>
 🌐 دامنه فعال: <code>${safeHtml(activeDomain?.domain || "ثبت نشده")}</code>
-✅ تایید دامنه: <code>${activeDomain?.verified ? "تایید شد" : activeDomain ? "در انتظار" : "نامشخص"}</code>
-⚡ وضعیت آپ‌استریم: <code>${safeHtml(upstreamStatus)}</code> (${safeHtml(upstreamAt)})
-🧾 آخرین اسنپ‌شات: <code>${safeHtml(snapshot?.updated_at || "-")}</code> (${snapshotFresh})
-🔗 پیشوند لینک مشتری: <code>${safeHtml(prefixes.mainPrefix || "-")}</code>
+${domainStatusIcon} وضعیت تایید دامنه: <code>${activeDomain?.verified ? "verified" : activeDomain ? "pending" : "unset"}</code>
+⚡ وضعیت آپ‌استریم: <code>${safeHtml(upstreamStatus)}</code>
+🕒 آخرین تست آپ‌استریم: <code>${safeHtml(upstreamAt)}</code>
+${snapshotIcon} وضعیت اسنپ‌شات: <code>${safeHtml(snapshotFresh)}</code>
+🕒 زمان اسنپ‌شات: <code>${safeHtml(snapshot?.updated_at || "-")}</code>
+🔗 branded link prefix: <code>${safeHtml(prefixes.mainPrefix || "-")}</code>
 
-دستورات اصلی:
-/set_upstream لینک_پنل
-/set_domain example.com
-/set_channel -100xxxxxxxxxx
-/extras
-/rules
-/link
-/rotate
-/logs
-/cancel
+اقدام بعدی:
+• اگر آپ‌استریم ندارید: /set_upstream
+• برای دامنه اختصاصی: /set_domain و بعد /verify_domain
+• برای راهنمای کامل: /help
     `.trim();
 
     const keyboard = {
       inline_keyboard: [
         [
-          { text: GLASS_BTN("مدیریت آپ‌استریم‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_upstream" })) },
-          { text: GLASS_BTN("تایید دامنه"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_domain" })) },
+          { text: GLASS_BTN("Wizard آپ‌استریم"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_upstream" })) },
+          { text: GLASS_BTN("Wizard دامنه"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_domain" })) },
         ],
         [
-          { text: GLASS_BTN("مدیریت لینک‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_link" })) },
-          { text: GLASS_BTN("مدیریت افزودنی‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_extras" })) },
+          { text: GLASS_BTN("Wizard کانال"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_channel" })) },
+          { text: GLASS_BTN("Wizard لینک مشتری"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_link" })) },
         ],
         [
+          { text: GLASS_BTN("Wizard افزودنی"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_extras" })) },
           { text: GLASS_BTN("قوانین"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_rules" })) },
-          { text: GLASS_BTN("اعلان‌ها"), callback_data: utf8SafeEncode(JSON.stringify({ action: "panel_channel" })) },
         ],
+        [{ text: GLASS_BTN("راهنما"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_help" })) }],
       ],
     };
     return { text, keyboard };
@@ -3285,48 +3400,42 @@ ${items || "فعلاً لاگی ثبت نشده."}
     `.trim();
     return { text, keyboard: null };
   },
-  buildOnboardingMessage(env) {
-    const baseUrl = String(env.BASE_URL || "").replace(/\/$/, "");
-    const text = "You are not an operator yet. Send /invite CODE or contact admin.";
-    const keyboard = baseUrl
-      ? {
-          inline_keyboard: [[{ text: GLASS_BTN("Open web login"), url: baseUrl }]],
-        }
-      : null;
-    return { text, keyboard };
-  },
-  async handleInvite(env, db, telegramUser, text, logger, existingOperator = null) {
-    const inviteCode = text.replace("/invite", "").trim();
-    const log = logger || Logger;
-    if (!inviteCode) {
-      await this.sendMessage(env, telegramUser.id, "❗️فرمت: /invite CODE", null, log, {
-        telegram_user_id: telegramUser.id,
-      });
-      return new Response("ok");
-    }
-    const invite = await D1.getInviteCode(db, inviteCode, log);
-    if (!invite || invite.used_at) {
-      await this.sendMessage(env, telegramUser.id, "❗️کد دعوت معتبر نیست یا قبلاً استفاده شده است.", null, log, {
-        telegram_user_id: telegramUser.id,
-      });
-      return new Response("ok");
-    }
-    const displayName = telegramUser.first_name || telegramUser.username || "Operator";
-    let operator = existingOperator || (await D1.getOperatorByTelegramId(db, telegramUser.id, log));
-    if (!operator) {
-      operator = await D1.createOperator(db, telegramUser.id, displayName, "operator", "active", log);
-    } else if (operator.status !== "active") {
-      await D1.updateOperatorStatus(db, operator.id, "active", log);
-      operator.status = "active";
-    }
-    await D1.useInviteCode(db, inviteCode, operator.id, log);
-    await D1.logAudit(db, { operator_id: operator.id, event_type: "invite_redeem" }, log);
-    const payload = await this.buildPanel(db, operator, env, log);
-    await this.sendMessage(env, telegramUser.id, payload.text, payload.keyboard, log, {
-      operator_id: operator.id,
-      telegram_user_id: operator.telegram_user_id,
-    });
-    return new Response("ok");
+  buildHelpMessage() {
+    const text = `
+${GLASS} <b>راهنمای کامل Operator Subscription Manager</b>
+
+این ربات فقط پنل اپراتور است و مشتری‌ها نباید با ربات چت کنند.
+
+شروع سریع:
+1) لینک پنل مشتری را بفرست یا <code>/set_upstream</code>
+2) <code>/set_domain</code> (اختیاری) + <code>/verify_domain</code>
+3) <code>/set_channel</code> (اختیاری برای اعلان)
+4) <code>/extras</code> و <code>/rules</code>
+5) <code>/link</code> برای کپی branded link prefix
+
+دستورات:
+/panel - پنل اپراتور
+/help - راهنمای کامل
+/set_upstream - تنظیم آپ‌استریم
+/set_domain - تنظیم دامنه
+/verify_domain - بررسی تایید دامنه
+/set_channel - تنظیم کانال اعلان‌ها
+/link - ساخت لینک مشتری / مشاهده prefix
+/extras - مدیریت افزودنی‌ها
+/add_extra - افزودن کانفیگ
+/rules - قوانین خروجی
+/set_rules - تنظیم قوانین
+/rotate - چرخش لینک
+/logs - لاگ‌های اخیر
+/cancel - لغو عملیات در جریان
+
+Smart Paste:
+فقط لینک پنل مشتری را بفرست.
+    `.trim();
+    return {
+      text,
+      keyboard: { inline_keyboard: [[{ text: GLASS_BTN("پنل اپراتور"), callback_data: utf8SafeEncode(JSON.stringify({ action: "show_panel" })) }]] },
+    };
   },
   async getMe(env, logger, ctx = {}) {
     return telegramFetch("getMe", null, { env, logger, label: "telegram_get_me", ...ctx });
@@ -3469,24 +3578,17 @@ const Router = {
     const displayName = body.first_name || body.username || "Operator";
     let operator = await D1.getOperatorByTelegramId(env.DB, telegramId, logger);
     if (!operator) {
-      let status = "pending";
-      if (isAdmin(telegramId, env)) status = "active";
-      if (body.invite_code) {
-        const invite = await D1.getInviteCode(env.DB, body.invite_code, logger);
-        if (!invite || invite.used_at) {
-          (logger || Logger).warn("telegram_login_invalid_invite", {
-            error_code: "E_AUTH_FORBIDDEN",
-            reason: ERROR_CODES.E_AUTH_FORBIDDEN.reason,
-            hints: ERROR_CODES.E_AUTH_FORBIDDEN.hints,
-          });
-          span.end({ status: 403 });
-          return jsonResponse({ ok: false, error: "invalid_invite" }, 403);
-        }
-        operator = await D1.createOperator(env.DB, telegramId, displayName, "operator", status, logger);
-        await D1.useInviteCode(env.DB, body.invite_code, operator.id, logger);
-      } else {
-        operator = await D1.createOperator(env.DB, telegramId, displayName, "operator", status, logger);
-      }
+      operator = await D1.createOperator(
+        env.DB,
+        telegramId,
+        displayName,
+        isAdmin(telegramId, env) ? "admin" : "operator",
+        "active",
+        logger
+      );
+    } else if (operator.status !== "active") {
+      await D1.updateOperatorProfile(env.DB, operator.id, { status: "active" }, logger);
+      operator.status = "active";
     }
     const payload = {
       sub: operator.id,
@@ -4212,11 +4314,9 @@ const Router = {
   <div class="wrap">
     <div class="card">
       <h1>پنل اشتراک برند برای اپراتورها</h1>
-      <p class="muted">ورود از طریق Telegram Login Widget و کد دعوت مدیر.</p>
+      <p class="muted">ورود مستقیم از طریق Telegram Login Widget (بدون نیاز به کد دعوت).</p>
       <div class="panel" id="login-panel">
         <div id="telegram-login"></div>
-        <p class="muted">کد دعوت (اختیاری)</p>
-        <input id="invite-code" placeholder="Invite code" />
       </div>
       <div class="panel hidden" id="dashboard">
         <div class="row">
@@ -4233,7 +4333,6 @@ const Router = {
     </div>
   </div>
   <script>
-    const inviteInput = document.getElementById('invite-code');
     const dashboard = document.getElementById('dashboard');
     const loginPanel = document.getElementById('login-panel');
     const linksEl = document.getElementById('links');
@@ -4314,11 +4413,10 @@ const Router = {
     });
 
     window.onTelegramAuth = async (user) => {
-      const payload = { ...user, invite_code: inviteInput.value || undefined };
       const res = await fetch('${base}/auth/telegram', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(user)
       });
       const data = await res.json();
       if (data.ok) {
