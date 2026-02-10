@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS operator_settings (
   channel_id TEXT,
   notify_fetches INTEGER NOT NULL DEFAULT 0 CHECK (notify_fetches IN (0,1)),
   last_fetch_notify_at TEXT,
-  last_upstream_status TEXT NOT NULL DEFAULT 'unset' CHECK (last_upstream_status IN ('unset','ok','invalid','error')),
+  last_upstream_status TEXT NOT NULL DEFAULT 'unset' CHECK (last_upstream_status IN ('unset','pending_test','testing','ok','invalid','error')),
   last_upstream_at TEXT,
   pending_action TEXT,
   pending_meta TEXT,
@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS subscription_rules (
   naming_prefix TEXT,
   blocked_keywords TEXT,
   output_format TEXT NOT NULL DEFAULT 'base64' CHECK (output_format IN ('base64','plain')),
+  sub_links_policy TEXT NOT NULL DEFAULT 'append' CHECK (sub_links_policy IN ('append','upstream_only','subs_only','round_robin','weighted')),
   limit_lines INTEGER NOT NULL DEFAULT 5000,
   limit_bytes INTEGER NOT NULL DEFAULT 2097152,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -91,6 +92,40 @@ CREATE TABLE IF NOT EXISTS customer_links (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (operator_id) REFERENCES operators(id) ON DELETE CASCADE
+);
+
+
+CREATE TABLE IF NOT EXISTS customers (
+  id TEXT PRIMARY KEY,
+  operator_id TEXT NOT NULL,
+  label TEXT,
+  public_token TEXT UNIQUE NOT NULL,
+  panel_token_enc TEXT,
+  upstream_override_enc TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  overrides_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  revoked_at TEXT,
+  FOREIGN KEY (operator_id) REFERENCES operators(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS subscription_links (
+  id TEXT PRIMARY KEY,
+  operator_id TEXT NOT NULL,
+  title TEXT,
+  url TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  headers_json TEXT,
+  priority INTEGER NOT NULL DEFAULT 0,
+  weight INTEGER NOT NULL DEFAULT 1,
+  scope TEXT NOT NULL DEFAULT 'operator' CHECK (scope IN ('operator','customer')),
+  customer_id TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT,
+  FOREIGN KEY (operator_id) REFERENCES operators(id) ON DELETE CASCADE,
+  FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS domains (
@@ -210,3 +245,8 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_operator ON api_keys(operator_id, key_ha
 CREATE INDEX IF NOT EXISTS idx_app_state_key ON app_state(key);
 
 COMMIT;
+
+CREATE INDEX IF NOT EXISTS idx_customers_operator ON customers(operator_id, enabled, created_at);
+CREATE INDEX IF NOT EXISTS idx_customers_public_token ON customers(public_token);
+CREATE INDEX IF NOT EXISTS idx_subscription_links_operator ON subscription_links(operator_id, enabled, priority);
+CREATE INDEX IF NOT EXISTS idx_subscription_links_customer ON subscription_links(customer_id, enabled);
