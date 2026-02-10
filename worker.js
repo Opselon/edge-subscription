@@ -255,6 +255,107 @@ const safeHtml = (text) =>
     .replace(/\"/g, "&quot;")
     .replace(/'/g, "&#39;");
 
+const sanitizeTelegramHtml = (text) => {
+  const escaped = safeHtml(text || "");
+  return escaped.replace(/&lt;(\/?)(b|code|i|u|s|pre)&gt;/g, "<$1$2>");
+};
+
+const TELEGRAM_INLINE_TEXT_LIMIT = 64;
+
+const isSafeTelegramButtonUrl = (value) => {
+  const normalized = String(value || "").trim();
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    const scheme = parsed.protocol.replace(":", "");
+    return SAFE_REDIRECT_SCHEMES.includes(scheme);
+  } catch {
+    return false;
+  }
+};
+
+const sanitizeInlineKeyboard = (keyboard) => {
+  const result = {
+    keyboard: null,
+    removedCount: 0,
+    removedReasons: {},
+    rowCount: 0,
+  };
+  if (!keyboard || !Array.isArray(keyboard.inline_keyboard)) return result;
+
+  const markRemoved = (reason) => {
+    result.removedCount += 1;
+    result.removedReasons[reason] = (result.removedReasons[reason] || 0) + 1;
+  };
+
+  const rows = [];
+  for (const row of keyboard.inline_keyboard) {
+    if (!Array.isArray(row)) {
+      markRemoved("invalid_row");
+      continue;
+    }
+    const nextRow = [];
+    for (const button of row) {
+      if (!button || typeof button !== "object" || Array.isArray(button)) {
+        markRemoved("invalid_button_shape");
+        continue;
+      }
+      if (typeof button.text !== "string") {
+        markRemoved("invalid_text");
+        continue;
+      }
+      const text = button.text.trim().slice(0, TELEGRAM_INLINE_TEXT_LIMIT);
+      if (!text) {
+        markRemoved("empty_text");
+        continue;
+      }
+
+      const url = typeof button.url === "string" ? button.url.trim() : "";
+      const callbackData = typeof button.callback_data === "string" ? button.callback_data.trim() : "";
+      const hasUrl = Boolean(url);
+      const hasCallback = Boolean(callbackData);
+
+      if (hasUrl && hasCallback) {
+        markRemoved("both_url_and_callback_data");
+        continue;
+      }
+      if (!hasUrl && !hasCallback) {
+        markRemoved("missing_url_and_callback_data");
+        continue;
+      }
+
+      if (hasUrl) {
+        if (!isSafeTelegramButtonUrl(url)) {
+          markRemoved("invalid_url");
+          continue;
+        }
+        nextRow.push({ text, url });
+      } else {
+        nextRow.push({ text, callback_data: callbackData });
+      }
+    }
+    if (nextRow.length) rows.push(nextRow);
+  }
+
+  if (!rows.length) return result;
+  result.keyboard = { inline_keyboard: rows };
+  result.rowCount = rows.length;
+  return result;
+};
+
+const createTelegramSendMessageBody = (chatId, text, keyboard) => {
+  const sanitizedHtml = sanitizeTelegramHtml(text);
+  const sanitizeResult = sanitizeInlineKeyboard(keyboard);
+  const body = {
+    chat_id: chatId,
+    text: sanitizedHtml,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+  if (sanitizeResult.keyboard) body.reply_markup = sanitizeResult.keyboard;
+  return { body, sanitizeResult };
+};
+
 const nowIso = () => new Date().toISOString();
 
 const parseCommaList = (value) =>
@@ -502,7 +603,8 @@ const buildPremiumSubscriptionMessage = (payload) => {
   const { operatorName, username, mainLink } = payload;
   let redirectBase = "";
   try {
-    redirectBase = new URL(mainLink).origin;
+    const parsed = new URL(mainLink);
+    redirectBase = parsed.origin;
   } catch {
     redirectBase = "";
   }
@@ -525,37 +627,47 @@ const buildPremiumSubscriptionMessage = (payload) => {
 3) لینک بالا را کپی و وارد کنید.
 4) ذخیره کنید و متصل شوید.
   `.trim();
+  const safeMainLink = String(mainLink || "").trim();
+  const encodedMainLink = encodeURIComponent(safeMainLink);
+  const encodedName = encodeURIComponent(targetName);
+  const deepLinks = {
+    v2rayng: `v2rayng://install-config?url=${encodedMainLink}#${encodedName}`,
+    nekobox: `sn://subscription?url=${encodedMainLink}&name=${encodedName}`,
+    v2box: `v2box://install-sub?url=${encodedMainLink}&name=${encodedName}`,
+    streisand: `streisand://import/${encodedMainLink}`,
+  };
+  const buildButtonUrl = (directUrl) => {
+    if (redirectBase && isSafeTelegramButtonUrl(redirectBase)) {
+      return `${redirectBase}/redirect?target=${encodeURIComponent(directUrl)}`;
+    }
+    if (isSafeTelegramButtonUrl(directUrl)) {
+      return directUrl;
+    }
+    return safeMainLink;
+  };
   const keyboard = {
     inline_keyboard: [
       [
         {
           text: "v2rayNG",
-          url: redirectBase
-            ? `${redirectBase}/redirect?target=${encodeURIComponent(`v2rayng://install-config?url=${mainLink}#${targetName}`)}`
-            : mainLink,
+          url: buildButtonUrl(deepLinks.v2rayng),
         },
         {
           text: "NekoBox",
-          url: redirectBase
-            ? `${redirectBase}/redirect?target=${encodeURIComponent(`sn://subscription?url=${mainLink}&name=${targetName}`)}`
-            : mainLink,
+          url: buildButtonUrl(deepLinks.nekobox),
         },
       ],
       [
         {
           text: "v2Box",
-          url: redirectBase
-            ? `${redirectBase}/redirect?target=${encodeURIComponent(`v2box://install-sub?url=${mainLink}&name=${targetName}`)}`
-            : mainLink,
+          url: buildButtonUrl(deepLinks.v2box),
         },
         {
           text: "Streisand",
-          url: redirectBase
-            ? `${redirectBase}/redirect?target=${encodeURIComponent(`streisand://import/${mainLink}`)}`
-            : mainLink,
+          url: buildButtonUrl(deepLinks.streisand),
         },
       ],
-      [{ text: "Share", url: `https://t.me/share/url?url=${encodeURIComponent(mainLink)}` }],
+      [{ text: "Share", url: `https://t.me/share/url?url=${encodedMainLink}` }],
     ],
   };
   return { text: quickGuide, keyboard };
@@ -3972,14 +4084,24 @@ Smart Paste:
     return result;
   },
   async sendMessage(env, chatId, text, keyboard, logger, extraCtx = {}) {
-    const body = {
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    };
-    if (keyboard) body.reply_markup = keyboard;
+    const { body, sanitizeResult } = createTelegramSendMessageBody(chatId, text, keyboard);
     const log = logger || Logger;
+    if (sanitizeResult.removedCount > 0) {
+      log.warn("inline_keyboard_sanitized", {
+        removed_count: sanitizeResult.removedCount,
+        removed_reasons: sanitizeResult.removedReasons,
+        request_id: extraCtx.request_id,
+        operator_id: extraCtx.operator_id,
+        telegram_user_id: extraCtx.telegram_user_id,
+      });
+    }
+    if (keyboard && !sanitizeResult.keyboard) {
+      log.warn("keyboard_dropped", {
+        request_id: extraCtx.request_id,
+        operator_id: extraCtx.operator_id,
+        telegram_user_id: extraCtx.telegram_user_id,
+      });
+    }
     try {
       const result = await telegramFetch("sendMessage", body, {
         env,
@@ -4997,6 +5119,8 @@ export const TestUtils = {
   resolveOperatorBaseUrl,
   buildOperatorScopedSubLink,
   buildPremiumSubscriptionMessage,
+  sanitizeInlineKeyboard,
+  createTelegramSendMessageBody,
 };
 
 export default {
