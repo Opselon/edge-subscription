@@ -319,6 +319,28 @@ const parseMessageText = (message) => message?.text?.trim() || "";
 
 const normalizeBaseUrl = (value) => String(value || "").trim().replace(/\/$/, "");
 
+const resolveOperatorBaseUrl = ({ activeDomain, brandingBaseUrl, envBaseUrl, request }) => {
+  if (activeDomain) return `https://${activeDomain}`;
+  const branded = normalizeBaseUrl(brandingBaseUrl);
+  if (branded) return branded;
+  const envBase = normalizeBaseUrl(envBaseUrl);
+  if (envBase) return envBase;
+  if (request?.url) {
+    try {
+      return new URL(request.url).origin;
+    } catch {
+      return "";
+    }
+  }
+  return "";
+};
+
+const buildOperatorScopedSubLink = ({ baseUrl, shareToken, panelToken }) => {
+  const normalizedBase = normalizeBaseUrl(baseUrl);
+  if (!normalizedBase || !shareToken || !panelToken) return "";
+  return `${normalizedBase}/sub/${shareToken}/${panelToken}`;
+};
+
 const parsePanelSubscriptionInput = (text) => {
   const trimmed = String(text || "").trim();
   if (!trimmed) return null;
@@ -484,20 +506,20 @@ const buildPremiumSubscriptionMessage = (payload) => {
   } catch {
     redirectBase = "";
   }
-  const label = operatorName || "Premium";
-  const targetName = label || "Premium";
+  const label = operatorName || "Rexa Panel";
+  const targetName = label || "Rexa Panel";
   const quickGuide = `
-${GLASS} <b>Rexa Panel</b>
+🧊 Rexa Panel
 
-👤 کاربر: <b>${safeHtml(username || "Premium User")}</b>
+👤 کاربر: ${safeHtml(username || "Premium User")}
 
 🔗 لینک اشتراک اصلی:
 <code>${safeHtml(mainLink)}</code>
 
-🧊 <b>اتصال فوری با یک کلیک</b>
+🧊 اتصال فوری با یک کلیک
 دکمه‌های پایین را بزنید تا مستقیم اضافه شود.
 
-🧭 <b>راهنمای اتصال دستی</b>
+🧭 راهنمای اتصال دستی
 1) اپ مورد نظر را باز کنید.
 2) گزینه Import / اضافه کردن لینک را بزنید.
 3) لینک بالا را کپی و وارد کنید.
@@ -507,13 +529,13 @@ ${GLASS} <b>Rexa Panel</b>
     inline_keyboard: [
       [
         {
-          text: GLASS_BTN("v2rayNG"),
+          text: "v2rayNG",
           url: redirectBase
             ? `${redirectBase}/redirect?target=${encodeURIComponent(`v2rayng://install-config?url=${mainLink}#${targetName}`)}`
             : mainLink,
         },
         {
-          text: GLASS_BTN("NekoBox"),
+          text: "NekoBox",
           url: redirectBase
             ? `${redirectBase}/redirect?target=${encodeURIComponent(`sn://subscription?url=${mainLink}&name=${targetName}`)}`
             : mainLink,
@@ -521,19 +543,19 @@ ${GLASS} <b>Rexa Panel</b>
       ],
       [
         {
-          text: GLASS_BTN("v2Box"),
+          text: "v2Box",
           url: redirectBase
             ? `${redirectBase}/redirect?target=${encodeURIComponent(`v2box://install-sub?url=${mainLink}&name=${targetName}`)}`
             : mainLink,
         },
         {
-          text: GLASS_BTN("Streisand"),
+          text: "Streisand",
           url: redirectBase
             ? `${redirectBase}/redirect?target=${encodeURIComponent(`streisand://import/${mainLink}`)}`
             : mainLink,
         },
       ],
-      [{ text: GLASS_BTN("Share"), url: `https://t.me/share/url?url=${encodeURIComponent(mainLink)}` }],
+      [{ text: "Share", url: `https://t.me/share/url?url=${encodeURIComponent(mainLink)}` }],
     ],
   };
   return { text: quickGuide, keyboard };
@@ -2072,14 +2094,16 @@ const OperatorService = {
   async getBrandingInfo(db, operator, env, logger) {
     const settings = await D1.getSettings(db, operator.id, logger);
     const shareToken = await this.getShareToken(db, operator.id, logger);
-    const baseUrl = normalizeBaseUrl(env.BASE_URL || "");
+    const baseUrl = normalizeBaseUrl(settings?.base_url || env.BASE_URL || "");
     const nationalBaseUrl = normalizeBaseUrl(settings?.national_base_url || env.NATIONAL_BASE_URL || "");
     let domain = null;
+    let activeDomain = null;
     if (settings?.active_domain_id) {
       const active = await D1.getDomainById(db, settings.active_domain_id, logger);
+      if (active?.domain) activeDomain = active.domain;
       if (active?.verified) domain = active.domain;
     }
-    return { settings, shareToken, baseUrl, nationalBaseUrl, domain };
+    return { settings, shareToken, baseUrl, nationalBaseUrl, domain, activeDomain };
   },
 };
 
@@ -3119,8 +3143,8 @@ const Telegram = {
         const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
         const link = branding.domain
           ? `https://${branding.domain}/sub/${customer.public_token}`
-          : `${normalizeBaseUrl(branding.baseUrl)}/sub/${branding.shareToken}/${customer.public_token}`;
-        const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Premium", username: customer.label || "Customer", mainLink: link });
+          : `${normalizeBaseUrl(branding.baseUrl || env.BASE_URL || getBaseUrl(request, env))}/sub/${branding.shareToken}/${customer.public_token}`;
+        const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Rexa Panel", username: customer.label || "Customer", mainLink: link });
         await this.sendMessage(env, message.chat.id, msg.text, msg.keyboard, logger);
         span.end({ action: "add_customer_input" });
         return new Response("ok");
@@ -3147,17 +3171,19 @@ const Telegram = {
         const panelToken = parsed.token;
         const username = decodePanelTokenUsername(panelToken);
         const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
-        const prefixes = buildOperatorPrefixes({
-          baseUrl: branding.baseUrl,
-          nationalBaseUrl: branding.nationalBaseUrl,
-          shareToken: branding.shareToken,
-          domain: branding.domain,
+        const resolvedBase = resolveOperatorBaseUrl({
+          activeDomain: branding.activeDomain,
+          brandingBaseUrl: branding.baseUrl,
+          envBaseUrl: env.BASE_URL,
+          request,
         });
-        const workerBase = normalizeBaseUrl(branding.baseUrl || env.BASE_URL || getBaseUrl(request, env));
-        const mainPrefix = prefixes.mainPrefix || (branding.shareToken && workerBase ? `${workerBase}/sub/${branding.shareToken}/` : `${workerBase}/sub/`);
-        const mainLink = `${mainPrefix}${panelToken}`;
+        const mainLink = buildOperatorScopedSubLink({
+          baseUrl: resolvedBase,
+          shareToken: branding.shareToken,
+          panelToken,
+        });
         const payload = buildPremiumSubscriptionMessage({
-          operatorName: operator.display_name || "Premium",
+          operatorName: operator.display_name || "Rexa Panel",
           username,
           mainLink,
         });
@@ -3383,7 +3409,7 @@ ${lines.join("\n") || "خالی"}`, null, logger);
       const link = branding.domain
         ? `https://${branding.domain}/sub/${customer.public_token}`
         : `${normalizeBaseUrl(branding.baseUrl)}/sub/${branding.shareToken}/${customer.public_token}`;
-      const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Premium", username: customer.label || "Customer", mainLink: link });
+      const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Rexa Panel", username: customer.label || "Customer", mainLink: link });
       await this.sendMessage(env, message.chat.id, msg.text, msg.keyboard, logger);
       span.end({ action: "add_customer" });
       return new Response("ok");
@@ -4968,6 +4994,9 @@ export const TestUtils = {
   limitOutput,
   assertSafeUpstream,
   SubscriptionAssembler,
+  resolveOperatorBaseUrl,
+  buildOperatorScopedSubLink,
+  buildPremiumSubscriptionMessage,
 };
 
 export default {
