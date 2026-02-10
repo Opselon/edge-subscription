@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS operators (
   telegram_user_id INTEGER NOT NULL UNIQUE,
   display_name TEXT,
   role TEXT NOT NULL DEFAULT 'operator' CHECK (role IN ('admin','operator')),
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','active','inactive','removed')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('pending','active','inactive','removed')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -179,6 +179,14 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   FOREIGN KEY (operator_id) REFERENCES operators(id) ON DELETE SET NULL
 );
 
+
+CREATE TABLE IF NOT EXISTS app_state (
+  key TEXT PRIMARY KEY,
+  value TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS rate_limits (
   key TEXT PRIMARY KEY,
   count INTEGER NOT NULL DEFAULT 0,
@@ -199,5 +207,6 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_operator_time ON audit_logs(operator_i
 CREATE INDEX IF NOT EXISTS idx_rate_limits_key ON rate_limits(key);
 CREATE INDEX IF NOT EXISTS idx_rate_limits_window ON rate_limits(window_start);
 CREATE INDEX IF NOT EXISTS idx_api_keys_operator ON api_keys(operator_id, key_hash);
+CREATE INDEX IF NOT EXISTS idx_app_state_key ON app_state(key);
 
 COMMIT;
