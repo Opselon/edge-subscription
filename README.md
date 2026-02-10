@@ -93,32 +93,77 @@ Subscription links:
 - Add customer-level source during `/add_customer` wizard by sending a full URL
 - Merge order: upstream + subscription links + extras (default)
 
-## Telegram Commands
+## Telegram Commands (راهنمای کامل فارسی + مثال)
 
+> نکته UI/UX: برای جلوگیری از خطا، ابتدا دستور را با مقادیر کوتاه تست کنید، سپس داده‌های طولانی را ارسال کنید.
+
+### مدیریت پنل
 - `/panel` - پنل اپراتور
+  - مثال: `/panel`
 - `/help` - راهنمای کامل
+  - مثال: `/help`
 - `/set_upstream` - تنظیم آپ‌استریم
+  - مثال: `/set_upstream https://panel.example/sub/{{TOKEN}}`
 - `/set_domain` - تنظیم دامنه
+  - مثال: `/set_domain sub.goldmarket.ir`
 - `/verify_domain` - بررسی تایید دامنه
+  - مثال: `/verify_domain`
 - `/set_channel` - تنظیم کانال اعلان‌ها
-- `/link` - ساخت لینک مشتری / مشاهده prefix
-- `/extras` - مدیریت افزودنی‌ها
-- `/add_extra` - افزودن کانفیگ
-- `/rules` - قوانین خروجی
-- `/set_rules` - تنظیم قوانین
-- `/rotate` - ساخت لینک جدید اپراتور/مشتری
-- `/logs` - لاگ‌های اخیر
+  - مثال: `/set_channel @goldmarket_logs`
+- `/link` - نمایش پیشوند لینک برند
+  - مثال: `/link`
+
+### مدیریت مشتری
 - `/customers` - لیست مشتری‌ها
+  - مثال: `/customers`
 - `/add_customer` - افزودن مشتری
+  - مثال: `/add_customer Ali-Tehran`
 - `/customer` - جزئیات مشتری
+  - مثال: `/customer CUSTOMER_ID`
 - `/del_customer` - حذف نرم مشتری
+  - مثال: `/del_customer CUSTOMER_ID`
 - `/toggle_customer` - فعال/غیرفعال مشتری
+  - مثال: `/toggle_customer CUSTOMER_ID`
+
+### مدیریت لینک اشتراک
 - `/add_sub_link` - افزودن لینک اشتراک
-- `/subs` - لیست لینک‌های اشتراک
-- `/del_sub_link` - حذف لینک اشتراک
+  - مثال: `/add_sub_link https://source.example/sub/a1b2c3`
+- `/subs` - لیست لینک‌های اشتراک + شناسه
+  - مثال: `/subs`
 - `/toggle_sub_link` - فعال/غیرفعال لینک اشتراک
+  - مثال: `/toggle_sub_link SUB_LINK_ID`
+- `/del_sub_link` - حذف لینک اشتراک
+  - مثال: `/del_sub_link SUB_LINK_ID`
+
+### قوانین و خروجی
+- `/extras` - مدیریت افزودنی‌ها
+  - مثال: `/extras`
+- `/add_extra` - افزودن کانفیگ
+  - مثال کوتاه: `/add_extra VIP-Mix | vmess://...`
+  - مثال متن طولانی:
+    ```
+    /add_extra Full-Mix | vmess://...
+    vless://...
+    ss://...
+    ```
+- `/rules` - قوانین خروجی
+  - مثال: `/rules`
+- `/set_rules` - تنظیم قوانین
+  - مثال: `/set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam format=base64`
+- `/rotate` - ساخت لینک جدید اپراتور/مشتری
+  - مثال: `/rotate`
+- `/logs` - لاگ‌های اخیر
+  - مثال: `/logs`
 - `/cancel` - لغو عملیات در جریان
+  - مثال: `/cancel`
 - `/admin_sync_commands` - آپلود مجدد دستورات ربات (admin)
+  - مثال: `/admin_sync_commands`
+
+### راهنمای کار با متن‌های طولانی
+- برای payload های بلند، بین خطوط از newline استفاده کنید.
+- بهترین الگو برای `/add_extra`: `عنوان | متن-کانفیگ`.
+- اگر متن شامل چند خط است، بعد از `|` هر خط را جداگانه بفرستید.
+- در `/set_rules` فقط کلیدهای پشتیبانی‌شده را بفرستید: `merge`, `dedupe`, `sanitize`, `prefix`, `keywords`, `format`.
 
 ## Bot command sync (`setMyCommands`)
 - Worker syncs commands via Telegram `setMyCommands` and stores timestamp in `app_state.commands_synced_at`.
