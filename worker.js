@@ -350,6 +350,56 @@ const parsePanelSubscriptionInput = (text) => {
   return null;
 };
 
+const normalizeUpstreamInput = (text) => {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return { ok: false, reason: "empty" };
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { ok: false, reason: "invalid_url" };
+  }
+  if (parsed.protocol !== "https:") return { ok: false, reason: "https_only" };
+  const path = parsed.pathname || "/";
+  const tokenMatch = path.match(/\/sub\/([^/]+)\/?$/);
+  const hasTemplate = trimmed.includes("{{TOKEN}}");
+  let templatePath = "/sub/{{TOKEN}}";
+  let sampleToken = null;
+
+  if (hasTemplate) {
+    const count = (trimmed.match(/\{\{TOKEN\}\}/g) || []).length;
+    if (count !== 1) return { ok: false, reason: "template_must_have_single_token" };
+    return {
+      ok: true,
+      templateUrl: trimmed,
+      format_hint: "template",
+      origin: `${parsed.protocol}//${parsed.host}`,
+    };
+  }
+
+  if (tokenMatch) {
+    sampleToken = tokenMatch[1];
+    const base = path.replace(/\/sub\/[^/]+\/?$/, "").replace(/\/$/, "");
+    templatePath = `${base}/sub/{{TOKEN}}`;
+  } else if (/\/sub\/?$/.test(path)) {
+    const base = path.replace(/\/sub\/?$/, "").replace(/\/$/, "");
+    templatePath = `${base}/sub/{{TOKEN}}`;
+  } else if (path !== "/") {
+    const base = path.replace(/\/$/, "");
+    templatePath = `${base}/sub/{{TOKEN}}`;
+  }
+
+  templatePath = templatePath.replace(/\/sub\/sub\//g, "/sub/");
+  const templateUrl = `${parsed.protocol}//${parsed.host}${templatePath}${parsed.search || ""}`;
+  return {
+    ok: true,
+    templateUrl,
+    format_hint: "template",
+    ...(sampleToken ? { sample_token: sampleToken } : {}),
+    origin: `${parsed.protocol}//${parsed.host}`,
+  };
+};
+
 const decodePanelTokenUsername = (token) => {
   if (!token) return "Premium User";
   try {
@@ -498,6 +548,7 @@ const parseRulesArgs = (text) => {
     const value = rest.join("=");
     if (!key || value === undefined) continue;
     if (key === "merge") patch.merge_policy = value;
+    if (key === "sub_links") patch.sub_links_policy = value;
     if (key === "dedupe") patch.dedupe = value === "1" ? 1 : 0;
     if (key === "sanitize") patch.sanitize = value === "1" ? 1 : 0;
     if (key === "prefix") {
@@ -508,6 +559,21 @@ const parseRulesArgs = (text) => {
     if (key === "format") patch.output_format = value;
   }
   return patch;
+};
+
+const parseAddCustomerInput = (text) => {
+  const parsed = parsePanelSubscriptionInput(text);
+  if (parsed?.token) return { type: "panel_token", token: parsed.token, template: parsed.template || null };
+  const trimmed = String(text || "").trim();
+  if (/^[A-Za-z0-9_-]{8,}$/.test(trimmed)) return { type: "panel_token", token: trimmed, template: null };
+  if (trimmed.startsWith("https://")) return { type: "subscription_url", url: trimmed };
+  return { type: "unknown" };
+};
+
+const truncateLabel = (text, max = 50) => {
+  const value = String(text || "").trim();
+  if (!value) return null;
+  return value.length > max ? `${value.slice(0, max)}…` : value;
 };
 
 const summarizeUpstreamFailures = (payloads) => {
@@ -1520,6 +1586,168 @@ const D1 = {
       logger
     );
   },
+  async createCustomer(db, env, operatorId, payload, logger) {
+    const id = crypto.randomUUID();
+    const token = crypto.randomUUID();
+    const panelTokenEnc = payload.panel_token ? await encryptString(env, payload.panel_token) : null;
+    await dbRun(
+      db,
+      "customers.create",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO customers (id, operator_id, label, public_token, panel_token_enc, upstream_override_enc, enabled, overrides_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)"
+          )
+          .bind(
+            id,
+            operatorId,
+            payload.label || null,
+            token,
+            panelTokenEnc,
+            payload.upstream_override_enc || null,
+            payload.overrides_json || null,
+            nowIso(),
+            nowIso()
+          )
+          .run(),
+      logger
+    );
+    return this.getCustomerById(db, operatorId, id, logger);
+  },
+  async listCustomers(db, operatorId, logger) {
+    return dbAll(
+      db,
+      "customers.list",
+      () => db.prepare("SELECT * FROM customers WHERE operator_id = ? AND revoked_at IS NULL ORDER BY created_at DESC").bind(operatorId).all(),
+      logger
+    );
+  },
+  async getCustomerByToken(db, token, logger) {
+    return dbFirst(
+      db,
+      "customers.get_by_token",
+      () => db.prepare("SELECT * FROM customers WHERE public_token = ? AND revoked_at IS NULL LIMIT 1").bind(token).first(),
+      logger
+    );
+  },
+  async getCustomerById(db, operatorId, customerId, logger) {
+    return dbFirst(
+      db,
+      "customers.get_by_id",
+      () => db.prepare("SELECT * FROM customers WHERE id = ? AND operator_id = ? LIMIT 1").bind(customerId, operatorId).first(),
+      logger
+    );
+  },
+  async setCustomerEnabled(db, operatorId, customerId, enabled, logger) {
+    await dbRun(
+      db,
+      "customers.toggle",
+      () => db.prepare("UPDATE customers SET enabled = ?, updated_at = ? WHERE id = ? AND operator_id = ?").bind(enabled ? 1 : 0, nowIso(), customerId, operatorId).run(),
+      logger
+    );
+  },
+  async revokeCustomer(db, operatorId, customerId, logger) {
+    await dbRun(
+      db,
+      "customers.revoke",
+      () =>
+        db
+          .prepare("UPDATE customers SET enabled = 0, revoked_at = ?, updated_at = ? WHERE id = ? AND operator_id = ?")
+          .bind(nowIso(), nowIso(), customerId, operatorId)
+          .run(),
+      logger
+    );
+  },
+  async listSubscriptionLinks(db, operatorId, scope = null, customerId = null, logger) {
+    const where = ["operator_id = ?", "deleted_at IS NULL"];
+    const params = [operatorId];
+    if (scope) {
+      where.push("scope = ?");
+      params.push(scope);
+    }
+    if (customerId) {
+      where.push("customer_id = ?");
+      params.push(customerId);
+    }
+    return dbAll(
+      db,
+      "subscription_links.list",
+      () =>
+        db
+          .prepare(`SELECT * FROM subscription_links WHERE ${where.join(" AND ")} ORDER BY priority DESC, created_at DESC`)
+          .bind(...params)
+          .all(),
+      logger
+    );
+  },
+  async listEnabledSubscriptionLinks(db, operatorId, customerId = null, logger) {
+    return dbAll(
+      db,
+      "subscription_links.list_enabled",
+      () =>
+        db
+          .prepare(
+            "SELECT * FROM subscription_links WHERE operator_id = ? AND deleted_at IS NULL AND enabled = 1 AND (scope = 'operator' OR (scope = 'customer' AND customer_id = ?)) ORDER BY priority DESC, created_at DESC"
+          )
+          .bind(operatorId, customerId || "")
+          .all(),
+      logger
+    );
+  },
+  async createSubscriptionLink(db, env, operatorId, payload, logger) {
+    const id = crypto.randomUUID();
+    const encryptedUrl = await encryptString(env, payload.url);
+    await dbRun(
+      db,
+      "subscription_links.create",
+      () =>
+        db
+          .prepare(
+            "INSERT INTO subscription_links (id, operator_id, title, url, enabled, headers_json, priority, weight, scope, customer_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          )
+          .bind(
+            id,
+            operatorId,
+            payload.title || null,
+            encryptedUrl,
+            payload.enabled === 0 ? 0 : 1,
+            payload.headers_json || null,
+            payload.priority ?? 0,
+            payload.weight ?? 1,
+            payload.scope || "operator",
+            payload.customer_id || null,
+            nowIso(),
+            nowIso()
+          )
+          .run(),
+      logger
+    );
+    return dbFirst(db, "subscription_links.get_by_id", () => db.prepare("SELECT * FROM subscription_links WHERE id = ?").bind(id).first(), logger);
+  },
+  async getSubscriptionLinkById(db, operatorId, id, logger) {
+    return dbFirst(
+      db,
+      "subscription_links.get_by_id",
+      () => db.prepare("SELECT * FROM subscription_links WHERE id = ? AND operator_id = ? AND deleted_at IS NULL").bind(id, operatorId).first(),
+      logger
+    );
+  },
+  async setSubscriptionLinkEnabled(db, operatorId, id, enabled, logger) {
+    await dbRun(
+      db,
+      "subscription_links.toggle",
+      () => db.prepare("UPDATE subscription_links SET enabled = ?, updated_at = ? WHERE id = ? AND operator_id = ?").bind(enabled ? 1 : 0, nowIso(), id, operatorId).run(),
+      logger
+    );
+  },
+  async deleteSubscriptionLink(db, operatorId, id, logger) {
+    await dbRun(
+      db,
+      "subscription_links.delete",
+      () => db.prepare("UPDATE subscription_links SET deleted_at = ?, updated_at = ? WHERE id = ? AND operator_id = ?").bind(nowIso(), nowIso(), id, operatorId).run(),
+      logger
+    );
+  },
   async upsertLastKnownGood(db, operatorId, token, bodyValue, bodyFormat, headersJson, logger) {
     await dbRun(
       db,
@@ -1831,12 +2059,12 @@ const OperatorService = {
 };
 
 const SubscriptionAssembler = {
-  async assemble(env, db, operatorId, panelToken, request, requestId, customerLink, preloaded = {}, logger) {
+  async assemble(env, db, operatorId, panelToken, request, requestId, customerContext, preloaded = {}, logger) {
     const span = (logger || Logger).span("subscription_assemble", { operator_id: operatorId });
     try {
       const settings = preloaded.settings || (await D1.getSettings(db, operatorId, logger));
       const baseRules = preloaded.rules || (await D1.getRules(db, operatorId, logger));
-      const overrides = safeJsonParse(customerLink?.overrides_json, {}, logger, {
+      const overrides = safeJsonParse(customerContext?.overrides_json, {}, logger, {
         error_code: "E_JSON_PARSE",
         operator_id: operatorId,
         context: "customer_link_overrides",
@@ -1847,7 +2075,9 @@ const SubscriptionAssembler = {
         ? (extras?.results || []).filter((item) => overrides.extras.includes(item.id))
         : (extras?.results || []);
 
+      const customerId = customerContext?.id || null;
       const upstreams = preloaded.upstreams || (await D1.listUpstreams(db, operatorId, logger));
+      const subscriptionLinks = preloaded.subscriptionLinks || (await D1.listEnabledSubscriptionLinks(db, operatorId, customerId, logger));
       const allowlist = parseCommaList(settings?.upstream_allowlist);
       const denylist = parseCommaList(settings?.upstream_denylist);
 
@@ -1872,6 +2102,12 @@ const SubscriptionAssembler = {
 
       const upstreamPayloads = await this.fetchUpstreams(env, db, upstreams?.results || [], allowlist, denylist, panelToken, logger);
       const selected = this.selectUpstreamsByPolicy(upstreamPayloads, rules?.merge_policy || "append", logger);
+      const subPayloads = await this.fetchSubscriptionLinks(env, subscriptionLinks?.results || [], allowlist, denylist, logger);
+      const selectedSubs = this.selectUpstreamsByPolicy(
+        subPayloads,
+        rules?.sub_links_policy === "subs_only" ? "append" : (rules?.sub_links_policy || "append"),
+        logger
+      );
       const extrasContent = selectedExtras.map((item) => item.content).join("\n");
 
       if (!selected.ok) {
@@ -1910,7 +2146,7 @@ const SubscriptionAssembler = {
 
       await D1.updateSettings(db, operatorId, { last_upstream_status: "ok", last_upstream_at: nowIso() }, logger);
 
-      const merged = this.mergeContent(selected.text, extrasContent, rules);
+      const merged = this.mergeContent(selected.text, selectedSubs.ok ? selectedSubs.text : "", extrasContent, rules);
       const processed = this.applyRules(merged, rules, logger);
       const limited = limitOutput(processed.split("\n"), rules?.limit_lines || APP.maxOutputLines, rules?.limit_bytes || APP.maxOutputBytes);
       const outputBody = limited.join("\n");
@@ -2017,6 +2253,36 @@ const SubscriptionAssembler = {
     span.end({ upstream_ok: results.filter((item) => item.ok).length });
     return results;
   },
+  async fetchSubscriptionLinks(env, links, allowlist, denylist, logger) {
+    return mapWithConcurrency(links, APP.upstreamMaxConcurrency, async (link) => {
+      try {
+        const decryptedUrl = await decryptString(env, link.url);
+        const validation = assertSafeUpstream(decryptedUrl, allowlist, denylist);
+        if (!validation.ok) {
+          await D1.logAudit(env.DB, { operator_id: link.operator_id, event_type: "sub_link_fetch_fail", meta_json: JSON.stringify({ reason: validation.error, link_id: link.id }) }, logger);
+          return { ok: false, status: 400, body: "", isBase64: false, error: validation.error, upstream: link };
+        }
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), APP.upstreamTimeoutMs);
+        const headers = link.headers_json
+          ? safeJsonParse(link.headers_json, { "user-agent": "v2rayNG" }, logger, { context: "sub_link_headers" })
+          : { "user-agent": "v2rayNG" };
+        const res = await fetchWithRedirects(
+          decryptedUrl,
+          { cf: { cacheTtl: 0 }, signal: controller.signal, headers },
+          APP.maxRedirects,
+          (nextUrl) => assertSafeUpstream(nextUrl, allowlist, denylist),
+          logger
+        );
+        const text = await res.text();
+        clearTimeout(timeout);
+        const decodeInfo = res.ok ? analyzeUpstreamBody(text) : { isBase64: false, reason: null };
+        return { ok: res.ok, status: res.status, body: text, isBase64: decodeInfo.isBase64, decodeReason: decodeInfo.reason, subscriptionUserinfo: null, upstream: link };
+      } catch (err) {
+        return { ok: false, status: 502, body: "", isBase64: false, error: err?.name === "AbortError" ? "timeout" : "fetch_failed", upstream: link };
+      }
+    });
+  },
   selectUpstreamsByPolicy(results, policy, logger) {
     (logger || Logger).info("upstream_select_policy", { policy, candidates: results.length });
     const valid = results.filter((item) => item.ok && isValidSubscriptionText(this.decodeSubscription(item.body, item.isBase64)));
@@ -2088,12 +2354,20 @@ const SubscriptionAssembler = {
       return body;
     }
   },
-  mergeContent(upstream, extras, rules) {
+  mergeContent(upstream, subLinks, extras, rules) {
+    if (typeof extras === "object" && rules === undefined) {
+      rules = extras;
+      extras = subLinks;
+      subLinks = "";
+    }
     const policy = rules?.merge_policy || "append";
+    const subPolicy = rules?.sub_links_policy || "append";
     if (policy === "upstream_only") return upstream || "";
     if (policy === "extras_only") return extras || "";
     if (policy === "replace") return extras || "";
-    return [upstream, extras].filter(Boolean).join("\n");
+    if (subPolicy === "upstream_only") return [upstream, extras].filter(Boolean).join("\n");
+    if (subPolicy === "subs_only") return [subLinks, extras].filter(Boolean).join("\n");
+    return [upstream, subLinks, extras].filter(Boolean).join("\n");
   },
   applyRules(content, rules, logger) {
     (logger || Logger).debug("apply_rules_start", {
@@ -2455,7 +2729,47 @@ const assembleWithTimeout = async (promise, timeoutMs) => {
   }
 };
 
-const refreshSnapshot = async (env, operatorId, subscriptionToken, panelToken, request, requestId, customerLink, logger) => {
+
+const saveNormalizedUpstream = async (env, db, operatorId, inputText, logger) => {
+  const normalized = normalizeUpstreamInput(inputText);
+  if (!normalized.ok) return normalized;
+  const upstreams = await D1.listUpstreamsAll(db, operatorId, logger);
+  const existing = (upstreams?.results || [])[0];
+  if (existing) {
+    await D1.updateUpstream(db, env, operatorId, existing.id, { url: normalized.templateUrl, format_hint: "template", enabled: 1, priority: 1 }, logger);
+  } else {
+    await D1.createUpstream(db, env, operatorId, { url: normalized.templateUrl, enabled: true, weight: 1, priority: 1, format_hint: "template" }, logger);
+  }
+  const pendingStatus = normalized.sample_token ? "testing" : "pending_test";
+  await D1.updateSettings(db, operatorId, { last_upstream_status: pendingStatus, last_upstream_at: nowIso() }, logger);
+  return {
+    ok: true,
+    templateUrl: normalized.templateUrl,
+    format_hint: "template",
+    sample_token: normalized.sample_token || null,
+    pendingStatus,
+  };
+};
+
+const buildUpstreamSaveMessage = (saved) => {
+  const line1 = `${GLASS} ✅ لینک آپ‌استریم ذخیره شد.`;
+  const normalizedLine = `• قالب نرمال‌شده: <code>${safeHtml(redactUrlForLog(saved.templateUrl))}</code>`;
+  const statusLine = `• وضعیت فعلی: <b>${safeHtml(saved.pendingStatus)}</b>`;
+  const next = "• مرحله بعد: لینک پنل مشتری را ارسال کنید تا لینک برند ساخته شود.";
+  if (saved.sample_token) {
+    return `${line1}
+${normalizedLine}
+${statusLine}
+${next}`;
+  }
+  return `${line1}
+${normalizedLine}
+${statusLine}
+✅ ذخیره شد، اما برای تست و فعال شدن سمت کاربر یک لینک کامل شامل توکن بفرستید (Smart Paste) یا یک توکن نمونه ارسال کنید.
+${next}`;
+};
+
+const refreshSnapshot = async (env, operatorId, subscriptionToken, panelToken, request, requestId, customerContext, logger) => {
   if (!operatorId || !subscriptionToken) return;
   const db = env.DB;
   const scopedLogger = (logger || Logger).child({ operator_id: operatorId });
@@ -2472,7 +2786,7 @@ const refreshSnapshot = async (env, operatorId, subscriptionToken, panelToken, r
     panelToken,
     request,
     requestId,
-    customerLink,
+    customerContext,
     {
       settings,
       rules,
@@ -2521,6 +2835,15 @@ const TELEGRAM_COMMANDS = [
   { command: "verify_domain", description: "بررسی تایید دامنه" },
   { command: "set_channel", description: "تنظیم کانال اعلان‌ها" },
   { command: "link", description: "ساخت لینک مشتری / مشاهده prefix" },
+  { command: "customers", description: "لیست مشتری‌ها" },
+  { command: "add_customer", description: "افزودن مشتری" },
+  { command: "customer", description: "جزئیات مشتری" },
+  { command: "del_customer", description: "حذف نرم مشتری" },
+  { command: "toggle_customer", description: "فعال/غیرفعال مشتری" },
+  { command: "add_sub_link", description: "افزودن لینک اشتراک" },
+  { command: "subs", description: "مدیریت لینک‌های اشتراک" },
+  { command: "del_sub_link", description: "حذف لینک اشتراک" },
+  { command: "toggle_sub_link", description: "فعال/غیرفعال لینک اشتراک" },
   { command: "extras", description: "مدیریت افزودنی‌ها" },
   { command: "add_extra", description: "افزودن کانفیگ" },
   { command: "rules", description: "قوانین خروجی" },
@@ -2679,19 +3002,25 @@ const Telegram = {
     if (!text.startsWith("/") && settings?.pending_action) {
       const action = settings.pending_action;
       if (action === "set_upstream") {
-        await D1.createUpstream(db, env, operator.id, { url: text, enabled: true, weight: 1, priority: 1 }, logger);
+        const saved = await saveNormalizedUpstream(env, db, operator.id, text, logger);
+        if (!saved.ok) {
+          await this.sendMessage(env, message.chat.id, `❗️ورودی آپ‌استریم معتبر نیست: <code>${safeHtml(saved.reason || "invalid")}</code>`, null, logger);
+          span.end({ action: "set_upstream_invalid" });
+          return new Response("ok");
+        }
         await D1.setPendingAction(db, operator.id, null, null, logger);
         await D1.logAudit(
           db,
           {
             operator_id: operator.id,
             event_type: "settings_update:upstream_url",
-            meta_json: JSON.stringify({ upstream: redactUrlForLog(text) }),
+            meta_json: JSON.stringify({ upstream: redactUrlForLog(saved.templateUrl), format_hint: "template" }),
           },
           logger
         );
+        if (saved.sample_token && ctx) ctx.waitUntil(testUpstreamConnection(env, db, operator.id, saved.sample_token, logger));
         await AuditService.notifyOperator(env, settings, "🧊 آپ‌استریم بروزرسانی شد.", logger);
-        await this.sendMessage(env, message.chat.id, `${GLASS} ✅ لینک آپ‌استریم ذخیره شد.\nاقدام بعدی: /panel`, null, logger);
+        await this.sendMessage(env, message.chat.id, buildUpstreamSaveMessage(saved), null, logger);
         span.end({ action: "set_upstream" });
         return new Response("ok");
       }
@@ -2728,6 +3057,55 @@ const Telegram = {
         span.end({ action: "set_channel" });
         return new Response("ok");
       }
+      if (action === "add_customer_label") {
+        const label = text === "-" ? null : truncateLabel(text);
+        await D1.setPendingAction(db, operator.id, "add_customer_input", { label }, logger);
+        await this.sendMessage(env, message.chat.id, "📌 حالا لینک پنل/توکن یا لینک اشتراک مشتری را بفرستید.", null, logger);
+        span.end({ action: "add_customer_label" });
+        return new Response("ok");
+      }
+      if (action === "add_customer_input") {
+        const meta = safeJsonParse(settings?.pending_meta, {}, logger, { context: "pending_meta" });
+        const parsed = parseAddCustomerInput(text);
+        if (parsed.type === "unknown") {
+          await this.sendMessage(env, message.chat.id, "❗️ورودی نامعتبر است. لینک پنل/توکن یا URL اشتراک بفرستید.", null, logger);
+          span.end({ action: "add_customer_input_invalid" });
+          return new Response("ok");
+        }
+        const customer = await D1.createCustomer(db, env, operator.id, { label: meta?.label || null, panel_token: parsed.type === "panel_token" ? parsed.token : null }, logger);
+        if (parsed.type === "subscription_url") {
+          const check = assertSafeUpstream(parsed.url, parseCommaList(settings?.upstream_allowlist), parseCommaList(settings?.upstream_denylist));
+          if (check.ok) await D1.createSubscriptionLink(db, env, operator.id, { url: parsed.url, scope: "customer", customer_id: customer.id, enabled: 1 }, logger);
+        }
+        if (parsed.template) {
+          const normalized = normalizeUpstreamInput(parsed.template.replace("{{TOKEN}}", parsed.token));
+          if (normalized.ok) await saveNormalizedUpstream(env, db, operator.id, normalized.templateUrl, logger);
+        }
+        await D1.setPendingAction(db, operator.id, null, null, logger);
+        await D1.logAudit(db, { operator_id: operator.id, event_type: "customer_create", meta_json: JSON.stringify({ customer_id: customer.id }) }, logger);
+        const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
+        const link = branding.domain
+          ? `https://${branding.domain}/sub/${customer.public_token}`
+          : `${normalizeBaseUrl(branding.baseUrl)}/sub/${branding.shareToken}/u/${customer.public_token}`;
+        const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Premium", username: customer.label || "Customer", mainLink: link, meliLink: null });
+        await this.sendMessage(env, message.chat.id, msg.text, msg.keyboard, logger);
+        span.end({ action: "add_customer_input" });
+        return new Response("ok");
+      }
+      if (action === "add_sub_link") {
+        const check = assertSafeUpstream(text, parseCommaList(settings?.upstream_allowlist), parseCommaList(settings?.upstream_denylist));
+        if (!check.ok) {
+          await this.sendMessage(env, message.chat.id, `❗️لینک مجاز نیست: ${safeHtml(check.error)}`, null, logger);
+          span.end({ action: "add_sub_link_invalid" });
+          return new Response("ok");
+        }
+        await D1.createSubscriptionLink(db, env, operator.id, { url: text, scope: "operator", enabled: 1 }, logger);
+        await D1.setPendingAction(db, operator.id, null, null, logger);
+        await D1.logAudit(db, { operator_id: operator.id, event_type: "sub_link_create" }, logger);
+        await this.sendMessage(env, message.chat.id, "✅ لینک اشتراک ذخیره شد.", null, logger);
+        span.end({ action: "add_sub_link" });
+        return new Response("ok");
+      }
     }
 
     if (!text.startsWith("/") && !settings?.pending_action) {
@@ -2735,41 +3113,20 @@ const Telegram = {
       if (parsed?.token) {
         const panelToken = parsed.token;
         const username = decodePanelTokenUsername(panelToken);
-        const upstreams = await D1.listUpstreams(db, operator.id, logger);
+        const normalized = parsed.template ? normalizeUpstreamInput(parsed.template.replace("{{TOKEN}}", panelToken)) : null;
+        const upstreams = await D1.listUpstreamsAll(db, operator.id, logger);
         const upstreamList = upstreams?.results || [];
-        const templateUrl = parsed.template;
-        let origin = parsed.base || parsed.origin;
-        let upstreamUnset = !upstreamList.length;
         let templateCreated = false;
-        if (!origin && upstreamList.length) {
-          try {
-            const existing = await decryptUpstreamUrl(env, upstreamList[0].url);
-            origin = new URL(existing).origin;
-          } catch {
-            origin = null;
-          }
-        }
-        if (!upstreamList.length && templateUrl) {
-          await D1.createUpstream(
-            db,
-            env,
-            operator.id,
-            { url: templateUrl, enabled: true, weight: 1, priority: 1, format_hint: "template" },
-            logger
-          );
-          templateCreated = true;
-          await D1.updateSettings(db, operator.id, { last_upstream_status: "unset", last_upstream_at: nowIso() }, logger);
-          await D1.logAudit(
-            db,
-            {
-              operator_id: operator.id,
-              event_type: "settings_update:upstream_auto",
-              meta_json: JSON.stringify({ upstream: redactUrlForLog(templateUrl), format_hint: "template" }),
-            },
-            logger
-          );
-        } else if (!upstreamList.length) {
-          await D1.updateSettings(db, operator.id, { last_upstream_status: "unset", last_upstream_at: nowIso() }, logger);
+        if (normalized?.ok && (!upstreamList.length || !panelToken)) {
+          const saved = await saveNormalizedUpstream(env, db, operator.id, normalized.templateUrl, logger);
+          templateCreated = !!saved.ok;
+        } else if (normalized?.ok && !upstreamList.length) {
+          const saved = await saveNormalizedUpstream(env, db, operator.id, normalized.templateUrl, logger);
+          templateCreated = !!saved.ok;
+        } else if (normalized?.ok && upstreamList.length) {
+          const first = upstreamList[0];
+          await D1.updateUpstream(db, env, operator.id, first.id, { url: normalized.templateUrl, format_hint: "template", enabled: 1 }, logger);
+          await D1.updateSettings(db, operator.id, { last_upstream_status: "testing", last_upstream_at: nowIso() }, logger);
         }
 
         const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
@@ -2791,11 +3148,7 @@ const Telegram = {
           username,
           mainLink,
           meliLink: meliLink || null,
-          warningLine: templateCreated
-            ? "آپ‌استریم تنظیم نشده بود؛ یک قالب از لینک شما ساخته شد."
-            : upstreamUnset
-              ? "آپ‌استریم تنظیم نشده است."
-              : null,
+          warningLine: templateCreated ? "قالب آپ‌استریم از لینک شما نرمال شد." : null,
         });
         await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
         if (ctx) {
@@ -2809,6 +3162,7 @@ const Telegram = {
         span.end({ action: "smart_paste" });
         return new Response("ok");
       }
+
       await this.sendMessage(
         env,
         message.chat.id,
@@ -2837,22 +3191,30 @@ const Telegram = {
       const value = text.replace("/set_upstream", "").trim();
       if (!value) {
         await D1.setPendingAction(db, operator.id, "set_upstream", null, logger);
-        await this.sendMessage(env, message.chat.id, `${GLASS} Wizard آپ‌استریم\n📌 لطفاً لینک آپ‌استریم را بفرستید.`, null, logger);
+        await this.sendMessage(env, message.chat.id, `${GLASS} Wizard آپ‌استریم
+📌 لطفاً لینک آپ‌استریم را بفرستید.
+(پشتیبانی: origin، /sub/، لینک کامل /sub/TOKEN و {{TOKEN}})`, null, logger);
         span.end({ action: "set_upstream_prompt" });
         return new Response("ok");
       }
-      await D1.createUpstream(db, env, operator.id, { url: value, enabled: true, weight: 1, priority: 1 }, logger);
+      const saved = await saveNormalizedUpstream(env, db, operator.id, value, logger);
+      if (!saved.ok) {
+        await this.sendMessage(env, message.chat.id, `❗️ورودی آپ‌استریم معتبر نیست: <code>${safeHtml(saved.reason || "invalid")}</code>`, null, logger);
+        span.end({ action: "set_upstream_invalid" });
+        return new Response("ok");
+      }
       await D1.logAudit(
         db,
         {
           operator_id: operator.id,
           event_type: "settings_update:upstream_url",
-          meta_json: JSON.stringify({ upstream: redactUrlForLog(value) }),
+          meta_json: JSON.stringify({ upstream: redactUrlForLog(saved.templateUrl), format_hint: "template" }),
         },
         logger
       );
+      if (saved.sample_token && ctx) ctx.waitUntil(testUpstreamConnection(env, db, operator.id, saved.sample_token, logger));
       await AuditService.notifyOperator(env, settings, "🧊 آپ‌استریم بروزرسانی شد.", logger);
-      await this.sendMessage(env, message.chat.id, `${GLASS} ✅ لینک آپ‌استریم ذخیره شد.\nاقدام بعدی: /panel`, null, logger);
+      await this.sendMessage(env, message.chat.id, buildUpstreamSaveMessage(saved), null, logger);
       span.end({ action: "set_upstream" });
       return new Response("ok");
     }
@@ -2990,6 +3352,126 @@ const Telegram = {
       const payload = await this.buildLinkPanel(db, operator, env, logger);
       await this.sendMessage(env, message.chat.id, payload.text, payload.keyboard, logger);
       span.end({ action: "link" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/customers")) {
+      const customers = await D1.listCustomers(db, operator.id, logger);
+      const lines = (customers?.results || []).slice(0, 20).map((item) => `• ${safeHtml(item.label || "بدون نام")} | <code>${safeHtml(item.public_token)}</code> | ${item.enabled ? "active" : "disabled"}`);
+      await this.sendMessage(env, message.chat.id, `${GLASS} مشتری‌ها
+${lines.join("\n") || "خالی"}`, null, logger);
+      span.end({ action: "customers" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/add_customer")) {
+      const value = text.replace("/add_customer", "").trim();
+      if (!value) {
+        await D1.setPendingAction(db, operator.id, "add_customer_label", null, logger);
+        await this.sendMessage(env, message.chat.id, `${GLASS} نام مشتری را بفرستید (اختیاری).`, null, logger);
+        span.end({ action: "add_customer_prompt" });
+        return new Response("ok");
+      }
+      const parsed = parseAddCustomerInput(value);
+      const customer = await D1.createCustomer(db, env, operator.id, { label: null, panel_token: parsed.type === "panel_token" ? parsed.token : null }, logger);
+      if (parsed.type === "subscription_url") {
+        const check = assertSafeUpstream(parsed.url, parseCommaList(settings?.upstream_allowlist), parseCommaList(settings?.upstream_denylist));
+        if (check.ok) await D1.createSubscriptionLink(db, env, operator.id, { url: parsed.url, scope: "customer", customer_id: customer.id, enabled: 1 }, logger);
+      }
+      const branding = await OperatorService.getBrandingInfo(db, operator, env, logger);
+      const link = branding.domain
+        ? `https://${branding.domain}/sub/${customer.public_token}`
+        : `${normalizeBaseUrl(branding.baseUrl)}/sub/${branding.shareToken}/u/${customer.public_token}`;
+      const msg = buildPremiumSubscriptionMessage({ operatorName: operator.display_name || "Premium", username: customer.label || "Customer", mainLink: link, meliLink: null });
+      await this.sendMessage(env, message.chat.id, msg.text, msg.keyboard, logger);
+      span.end({ action: "add_customer" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/customer")) {
+      const token = text.replace("/customer", "").trim();
+      const c = token ? await D1.getCustomerByToken(db, token, logger) : null;
+      if (!c) {
+        await this.sendMessage(env, message.chat.id, "❗️مشتری پیدا نشد.", null, logger);
+        span.end({ action: "customer_missing" });
+        return new Response("ok");
+      }
+      await this.sendMessage(env, message.chat.id, `👤 <b>${safeHtml(c.label || "بدون نام")}</b>
+توکن: <code>${safeHtml(c.public_token)}</code>
+وضعیت: ${c.enabled ? "active" : "disabled"}` , null, logger);
+      span.end({ action: "customer_show" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/toggle_customer")) {
+      const token = text.replace("/toggle_customer", "").trim();
+      const c = await D1.getCustomerByToken(db, token, logger);
+      if (!c) {
+        await this.sendMessage(env, message.chat.id, "❗️مشتری پیدا نشد.", null, logger);
+        span.end({ action: "toggle_customer_missing" });
+        return new Response("ok");
+      }
+      await D1.setCustomerEnabled(db, operator.id, c.id, !c.enabled, logger);
+      await this.sendMessage(env, message.chat.id, `✅ وضعیت مشتری تغییر کرد: ${!c.enabled ? "active" : "disabled"}`, null, logger);
+      span.end({ action: "toggle_customer" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/del_customer")) {
+      const token = text.replace("/del_customer", "").trim();
+      const c = await D1.getCustomerByToken(db, token, logger);
+      if (!c) {
+        await this.sendMessage(env, message.chat.id, "❗️مشتری پیدا نشد.", null, logger);
+        span.end({ action: "del_customer_missing" });
+        return new Response("ok");
+      }
+      await D1.revokeCustomer(db, operator.id, c.id, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "customer_revoked", meta_json: JSON.stringify({ customer_id: c.id }) }, logger);
+      await this.sendMessage(env, message.chat.id, "✅ مشتری غیرفعال شد.", null, logger);
+      span.end({ action: "del_customer" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/add_sub_link")) {
+      const urlValue = text.replace("/add_sub_link", "").trim();
+      if (!urlValue) {
+        await D1.setPendingAction(db, operator.id, "add_sub_link", null, logger);
+        await this.sendMessage(env, message.chat.id, `${GLASS} لینک اشتراک را بفرستید.`, null, logger);
+        span.end({ action: "add_sub_link_prompt" });
+        return new Response("ok");
+      }
+      const check = assertSafeUpstream(urlValue, parseCommaList(settings?.upstream_allowlist), parseCommaList(settings?.upstream_denylist));
+      if (!check.ok) {
+        await this.sendMessage(env, message.chat.id, `❗️لینک مجاز نیست: ${safeHtml(check.error)}`, null, logger);
+        span.end({ action: "add_sub_link_invalid" });
+        return new Response("ok");
+      }
+      await D1.createSubscriptionLink(db, env, operator.id, { url: urlValue, scope: "operator", enabled: 1 }, logger);
+      await D1.logAudit(db, { operator_id: operator.id, event_type: "sub_link_create" }, logger);
+      await this.sendMessage(env, message.chat.id, "✅ لینک اشتراک ذخیره شد.", null, logger);
+      span.end({ action: "add_sub_link" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/subs")) {
+      const links = await D1.listSubscriptionLinks(db, operator.id, null, null, logger);
+      const lines = (links?.results || []).slice(0, 30).map((item) => `• <code>${item.id}</code> [${item.scope}] ${item.enabled ? "on" : "off"}`);
+      await this.sendMessage(env, message.chat.id, `${GLASS} لینک‌های اشتراک
+${lines.join("\n") || "خالی"}`, null, logger);
+      span.end({ action: "subs" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/toggle_sub_link")) {
+      const id = text.replace("/toggle_sub_link", "").trim();
+      const link = await D1.getSubscriptionLinkById(db, operator.id, id, logger);
+      if (!link) {
+        await this.sendMessage(env, message.chat.id, "❗️لینک پیدا نشد.", null, logger);
+        span.end({ action: "toggle_sub_link_missing" });
+        return new Response("ok");
+      }
+      await D1.setSubscriptionLinkEnabled(db, operator.id, id, !link.enabled, logger);
+      await this.sendMessage(env, message.chat.id, "✅ وضعیت لینک بروزرسانی شد.", null, logger);
+      span.end({ action: "toggle_sub_link" });
+      return new Response("ok");
+    }
+    if (text.startsWith("/del_sub_link")) {
+      const id = text.replace("/del_sub_link", "").trim();
+      await D1.deleteSubscriptionLink(db, operator.id, id, logger);
+      await this.sendMessage(env, message.chat.id, "✅ لینک حذف شد.", null, logger);
+      span.end({ action: "del_sub_link" });
       return new Response("ok");
     }
     if (text.startsWith("/rotate")) {
@@ -3243,7 +3725,7 @@ const Telegram = {
       shareToken,
       domain: activeDomain?.verified ? activeDomain.domain : null,
     });
-    const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || "unset" : "unset";
+    const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || "pending_test" : "unset";
     const upstreamAt = (upstreams?.results || []).length ? settings?.last_upstream_at || "-" : "-";
     const domainStatusIcon = activeDomain?.verified ? "✅" : activeDomain ? "⛔" : "❓";
     const snapshotIcon = snapshotFresh === "fresh" ? "✅" : snapshotFresh === "stale" ? "⛔" : "❓";
@@ -3295,7 +3777,7 @@ ${snapshotIcon} وضعیت اسنپ‌شات: <code>${safeHtml(snapshotFresh)}</
       domain: activeDomain?.verified ? activeDomain.domain : null,
     });
     const upstreams = await D1.listUpstreams(db, operator.id, logger);
-    const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || "unset" : "unset";
+    const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || "pending_test" : "unset";
     const upstreamAt = (upstreams?.results || []).length ? settings?.last_upstream_at || "-" : "-";
     const extrasCount = await D1.countExtraConfigs(db, operator.id, logger);
     const rules = await D1.getRules(db, operator.id, logger);
@@ -3411,7 +3893,9 @@ ${GLASS} <b>راهنمای کامل Operator Subscription Manager</b>
 2) <code>/set_domain</code> (اختیاری) + <code>/verify_domain</code>
 3) <code>/set_channel</code> (اختیاری برای اعلان)
 4) <code>/extras</code> و <code>/rules</code>
-5) <code>/link</code> برای کپی branded link prefix
+5) <code>/add_customer</code> برای ساخت لینک امن مشتری
+6) <code>/add_sub_link</code> برای افزودن سورس اشتراک
+7) <code>/link</code> برای کپی branded link prefix
 
 دستورات:
 /panel - پنل اپراتور
@@ -3421,6 +3905,15 @@ ${GLASS} <b>راهنمای کامل Operator Subscription Manager</b>
 /verify_domain - بررسی تایید دامنه
 /set_channel - تنظیم کانال اعلان‌ها
 /link - ساخت لینک مشتری / مشاهده prefix
+/customers - لیست مشتری‌ها
+/add_customer - افزودن مشتری
+/customer - جزئیات مشتری
+/del_customer - حذف نرم مشتری
+/toggle_customer - فعال/غیرفعال مشتری
+/add_sub_link - افزودن لینک اشتراک
+/subs - مدیریت لینک‌های اشتراک
+/del_sub_link - حذف لینک اشتراک
+/toggle_sub_link - فعال/غیرفعال لینک اشتراک
 /extras - مدیریت افزودنی‌ها
 /add_extra - افزودن کانفیگ
 /rules - قوانین خروجی
@@ -3430,7 +3923,7 @@ ${GLASS} <b>راهنمای کامل Operator Subscription Manager</b>
 /cancel - لغو عملیات در جریان
 
 Smart Paste:
-فقط لینک پنل مشتری را بفرست.
+فقط لینک پنل مشتری را بفرست. اگر /set_upstream را با /sub/ بدهید، خودکار به قالب {{TOKEN}} تبدیل می‌شود.
     `.trim();
     return {
       text,
@@ -3674,7 +4167,7 @@ const Router = {
       const domains = await D1.listDomains(env.DB, operator.id, apiLogger);
       const activeDomain = (domains?.results || []).find((item) => item.active);
       const snapshot = await D1.getLatestSnapshotInfo(env.DB, operator.id, apiLogger);
-      const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || null : "unset";
+      const upstreamStatus = (upstreams?.results || []).length ? settings?.last_upstream_status || "pending_test" : "unset";
       const upstreamAt = (upstreams?.results || []).length ? settings?.last_upstream_at || null : null;
       span.end({ status: 200, path });
       return jsonResponse({
@@ -3780,9 +4273,20 @@ const Router = {
     let subscriptionToken = null;
     let panelToken = null;
     let customerLink = null;
+    let customer = null;
     let operatorId = null;
 
-    if (segments.length >= 3) {
+    if (segments.length >= 4 && segments[0] === "sub" && segments[2] === "u") {
+      const shareToken = segments[1];
+      const customerToken = segments[3];
+      customerLink = await D1.getCustomerLinkByToken(db, shareToken, scopedLogger);
+      if (customerLink) {
+        operatorId = customerLink.operator_id;
+        customer = await D1.getCustomerByToken(db, customerToken, scopedLogger);
+        if (customer?.operator_id !== operatorId) customer = null;
+        if (customer) subscriptionToken = customer.public_token;
+      }
+    } else if (segments.length >= 3) {
       const shareToken = segments[1];
       panelToken = segments[2];
       subscriptionToken = panelToken;
@@ -3792,8 +4296,14 @@ const Router = {
       const domain = await D1.getDomainByHostname(db, url.hostname, scopedLogger);
       if (domain?.operator_id) {
         operatorId = domain.operator_id;
-        panelToken = segments[1];
-        subscriptionToken = panelToken;
+        const maybeCustomer = await D1.getCustomerByToken(db, segments[1], scopedLogger);
+        if (maybeCustomer?.operator_id === operatorId) {
+          customer = maybeCustomer;
+          subscriptionToken = customer.public_token;
+        } else {
+          panelToken = segments[1];
+          subscriptionToken = panelToken;
+        }
       } else {
         customerLink = await D1.getCustomerLinkByToken(db, segments[1], scopedLogger);
         if (customerLink) {
@@ -3803,6 +4313,16 @@ const Router = {
       }
     }
 
+    if (customer?.enabled === 0 || customer?.revoked_at) {
+      return new Response("not found", { status: 404 });
+    }
+    if (customer?.panel_token_enc) {
+      try {
+        panelToken = await decryptString(env, customer.panel_token_enc);
+      } catch {
+        panelToken = null;
+      }
+    }
     if (!operatorId || !subscriptionToken) {
       scopedLogger.warn("subscription_not_found", {
         error_code: "E_INPUT_INVALID",
@@ -3956,7 +4476,7 @@ const Router = {
       });
     }
 
-    if (ctx) ctx.waitUntil(refreshSnapshot(env, operatorId, subscriptionToken, panelToken, request, requestId, customerLink, operatorLogger));
+    if (ctx) ctx.waitUntil(refreshSnapshot(env, operatorId, subscriptionToken, panelToken, request, requestId, customer || customerLink, operatorLogger));
 
     const lastGoodMem = getLastGoodMem(cacheKey);
     if (lastGoodMem) {
@@ -4026,7 +4546,7 @@ const Router = {
             panelToken,
             request,
             requestId,
-            customerLink,
+            customer || customerLink,
             { settings, rules, extras, upstreams },
             operatorLogger
           ),

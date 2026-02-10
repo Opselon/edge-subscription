@@ -7,7 +7,7 @@ This service is a multi-tenant subscription manager for VPN sellers/operators. I
 
 - Snapshot-based subscription delivery for massive scale
 - Multi-upstream subscription mixing + extras
-- Dynamic upstream URL templates per panel token (template/base/full modes)
+- Dynamic upstream URL templates per panel token with normalization (`origin`, `/sub/`, `/sub/<TOKEN>`, `{{TOKEN}}`)
 - Customer subscription links with per-link overrides
 - **Open onboarding (no invite code required)** for Telegram bot and web login
 - Secure API for automation with JWT or API keys
@@ -32,6 +32,8 @@ Key tables:
 - `extra_configs`
 - `subscription_rules`
 - `customer_links`
+- `customers`
+- `subscription_links`
 - `domains`
 - `api_keys`
 - `last_known_good`
@@ -74,7 +76,22 @@ Send panel subscription URL/token directly in bot chat:
   - worker domain: `https://WORKER/sub/<OPERATOR_SHARE_TOKEN>/<PANEL_TOKEN>`
 - Returns premium Persian message + one-click app buttons
 - Triggers snapshot refresh in background for instant usability
-- If no upstream exists and URL template is detectable, auto-creates upstream template
+- Upstream normalization:
+
+- `/set_upstream https://host:port/sub/` => `https://host:port/sub/{{TOKEN}}`
+- `/set_upstream https://host:port/sub/<TOKEN>` => stores template + sample token test
+- `/set_upstream https://host:port` => `https://host:port/sub/{{TOKEN}}`
+- After save, status is `testing` (with sample token) or `pending_test` (without sample).
+
+Customer links:
+- Verified domain customer links: `https://<domain>/sub/<customer_public_token>`
+- Worker customer links: `https://<worker>/sub/<shareToken>/u/<customer_public_token>`
+- `/sub/<token>` on verified domain first checks customer token, then legacy panel token.
+
+Subscription links:
+- Add operator-level sources with `/add_sub_link`
+- Add customer-level source during `/add_customer` wizard by sending a full URL
+- Merge order: upstream + subscription links + extras (default)
 
 ## Telegram Commands
 
@@ -91,6 +108,15 @@ Send panel subscription URL/token directly in bot chat:
 - `/set_rules` - تنظیم قوانین
 - `/rotate` - ساخت لینک جدید اپراتور/مشتری
 - `/logs` - لاگ‌های اخیر
+- `/customers` - لیست مشتری‌ها
+- `/add_customer` - افزودن مشتری
+- `/customer` - جزئیات مشتری
+- `/del_customer` - حذف نرم مشتری
+- `/toggle_customer` - فعال/غیرفعال مشتری
+- `/add_sub_link` - افزودن لینک اشتراک
+- `/subs` - لیست لینک‌های اشتراک
+- `/del_sub_link` - حذف لینک اشتراک
+- `/toggle_sub_link` - فعال/غیرفعال لینک اشتراک
 - `/cancel` - لغو عملیات در جریان
 - `/admin_sync_commands` - آپلود مجدد دستورات ربات (admin)
 
