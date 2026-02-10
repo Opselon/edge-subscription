@@ -122,6 +122,22 @@ describe("unit: smart paste link mapping", () => {
     const labels = payload.keyboard.inline_keyboard.flat().map((btn) => btn.text);
     assert.deepEqual(labels, ["v2rayNG", "NekoBox", "v2Box", "Streisand", "Share"]);
   });
+
+  it("uses https redirect buttons so Telegram accepts keyboard URLs", () => {
+    const payload = buildPremiumSubscriptionMessage({
+      operatorName: "Rexa Panel",
+      username: "Premium User",
+      mainLink: "https://worker.example.workers.dev/sub/OPERATOR123/PANEL456",
+    });
+    const appButtons = payload.keyboard.inline_keyboard.slice(0, 2).flat();
+    assert.equal(appButtons.length, 4);
+    for (const button of appButtons) {
+      assert.match(button.url, /^https:\/\/worker\.example\.workers\.dev\/redirect\?target=/);
+      const parsed = new URL(button.url);
+      const target = decodeURIComponent(parsed.searchParams.get("target") || "");
+      assert.match(target, /^(v2rayng|sn|v2box|streisand):\/\//);
+    }
+  });
 });
 
 describe("unit: telegram keyboard sanitization", () => {

@@ -37,6 +37,7 @@ const APP = {
 const GLASS = "🧊";
 const GLASS_BTN = (label) => `${GLASS} ${label}`;
 const SAFE_REDIRECT_SCHEMES = ["v2rayng", "sn", "streisand", "v2box", "https"];
+const SAFE_TELEGRAM_BUTTON_SCHEMES = ["https", "http", "tg"];
 const ALLOWED_CONFIG_SCHEMES = [
   "vmess://",
   "vless://",
@@ -268,7 +269,7 @@ const isSafeTelegramButtonUrl = (value) => {
   try {
     const parsed = new URL(normalized);
     const scheme = parsed.protocol.replace(":", "");
-    return SAFE_REDIRECT_SCHEMES.includes(scheme);
+    return SAFE_TELEGRAM_BUTTON_SCHEMES.includes(scheme);
   } catch {
     return false;
   }
@@ -3589,22 +3590,67 @@ ${lines.join("\n") || "خالی"}`, null, logger);
     }
     if (text.startsWith("/subs")) {
       const links = await D1.listSubscriptionLinks(db, operator.id, null, null, logger);
-      const lines = (links?.results || []).slice(0, 30).map((item) => `• <code>${item.id}</code> [${item.scope}] ${item.enabled ? "on" : "off"}`);
-      await this.sendMessage(env, message.chat.id, `${GLASS} لینک‌های اشتراک
-${lines.join("\n") || "خالی"}`, null, logger);
+      const lines = (links?.results || []).slice(0, 30).map(
+        (item, index) =>
+          `${index + 1}) <code>${safeHtml(item.id)}</code> | ${safeHtml(item.title || "بدون عنوان")} | ${item.scope === "customer" ? "مشتری" : "اپراتور"} | ${item.enabled ? "✅ فعال" : "⛔ غیرفعال"}`
+      );
+      const help = [
+        "",
+        "راهنما:",
+        "• تغییر وضعیت: <code>/toggle_sub_link SUB_LINK_ID</code>",
+        "• اگر شناسه نمی‌دانید، از همین لیست کپی کنید.",
+      ].join("\n");
+      await this.sendMessage(env, message.chat.id, `${GLASS} لینک‌های اشتراک\n${lines.join("\n") || "خالی"}${help}`, null, logger);
       span.end({ action: "subs" });
       return new Response("ok");
     }
     if (text.startsWith("/toggle_sub_link")) {
       const id = text.replace("/toggle_sub_link", "").trim();
+      if (!id) {
+        const links = await D1.listSubscriptionLinks(db, operator.id, null, null, logger);
+        const lines = (links?.results || []).slice(0, 10).map((item) => `• <code>${safeHtml(item.id)}</code> | ${safeHtml(item.title || "بدون عنوان")} | ${item.enabled ? "✅" : "⛔"}`);
+        await this.sendMessage(
+          env,
+          message.chat.id,
+          `❗️فرمت صحیح:
+<code>/toggle_sub_link SUB_LINK_ID</code>
+
+نمونه:
+<code>/toggle_sub_link 9ab12cde34fg</code>
+
+شناسه‌های موجود:
+${lines.join("\n") || "فعلاً لینکی ثبت نشده."}`,
+          null,
+          logger
+        );
+        span.end({ action: "toggle_sub_link_format" });
+        return new Response("ok");
+      }
       const link = await D1.getSubscriptionLinkById(db, operator.id, id, logger);
       if (!link) {
-        await this.sendMessage(env, message.chat.id, "❗️لینک پیدا نشد.", null, logger);
+        await this.sendMessage(
+          env,
+          message.chat.id,
+          `❗️لینک با این شناسه پیدا نشد:
+<code>${safeHtml(id)}</code>
+
+ابتدا <code>/subs</code> را بزنید و شناسه را دقیق کپی کنید.`,
+          null,
+          logger
+        );
         span.end({ action: "toggle_sub_link_missing" });
         return new Response("ok");
       }
       await D1.setSubscriptionLinkEnabled(db, operator.id, id, !link.enabled, logger);
-      await this.sendMessage(env, message.chat.id, "✅ وضعیت لینک بروزرسانی شد.", null, logger);
+      await this.sendMessage(
+        env,
+        message.chat.id,
+        `✅ وضعیت لینک بروزرسانی شد.
+شناسه: <code>${safeHtml(id)}</code>
+وضعیت جدید: ${!link.enabled ? "✅ فعال" : "⛔ غیرفعال"}`,
+        null,
+        logger
+      );
       span.end({ action: "toggle_sub_link" });
       return new Response("ok");
     }
@@ -4027,44 +4073,78 @@ ${items || "فعلاً لاگی ثبت نشده."}
     const text = `
 ${GLASS} <b>راهنمای کامل Operator Subscription Manager</b>
 
-این ربات فقط پنل اپراتور است و مشتری‌ها نباید با ربات چت کنند.
+این ربات برای مدیریت پنل اپراتور است.
+برای پیام‌های خیلی طولانی، آن‌ها را خط‌بندی کنید و مثال‌ها را دقیق مثل زیر بفرستید.
 
-شروع سریع:
-1) لینک پنل مشتری را بفرست یا <code>/set_upstream</code>
-2) <code>/set_domain</code> (اختیاری) + <code>/verify_domain</code>
-3) <code>/set_channel</code> (اختیاری برای اعلان)
-4) <code>/extras</code> و <code>/rules</code>
-5) <code>/add_customer</code> برای ساخت لینک امن مشتری
-6) <code>/add_sub_link</code> برای افزودن سورس اشتراک
-7) <code>/link</code> برای کپی branded link prefix
+<b>شروع سریع (پیشنهادی)</b>
+1) <code>/set_upstream https://example.com/sub/{{TOKEN}}</code>
+2) <code>/set_domain sub.example.com</code>
+3) <code>/verify_domain</code>
+4) <code>/add_customer GoldUser</code>
+5) <code>/add_sub_link https://provider.example/sub/a1b2c3</code>
+6) <code>/set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam format=base64</code>
 
-دستورات:
-/panel - پنل اپراتور
-/help - راهنمای کامل
-/set_upstream - تنظیم آپ‌استریم
-/set_domain - تنظیم دامنه
-/verify_domain - بررسی تایید دامنه
-/set_channel - تنظیم کانال اعلان‌ها
-/link - ساخت لینک مشتری / مشاهده prefix
-/customers - لیست مشتری‌ها
-/add_customer - افزودن مشتری
-/customer - جزئیات مشتری
-/del_customer - حذف نرم مشتری
-/toggle_customer - فعال/غیرفعال مشتری
-/add_sub_link - افزودن لینک اشتراک
-/subs - مدیریت لینک‌های اشتراک
-/del_sub_link - حذف لینک اشتراک
-/toggle_sub_link - فعال/غیرفعال لینک اشتراک
-/extras - مدیریت افزودنی‌ها
-/add_extra - افزودن کانفیگ
-/rules - قوانین خروجی
-/set_rules - تنظیم قوانین
-/rotate - چرخش لینک
-/logs - لاگ‌های اخیر
-/cancel - لغو عملیات در جریان
+<b>راهنمای ارسال متن طولانی</b>
+• در هر دستور، مقادیر را کوتاه و واضح بفرستید.
+• برای متن‌های بلند (مثل افزودنی)، ابتدا عنوان بگذارید و بعد از <code>|</code> متن را قرار دهید.
+• نمونه استاندارد:
+<code>/add_extra Full-Mix | vmess://...
+vless://...
+ss://...</code>
 
-Smart Paste:
-فقط لینک پنل مشتری را بفرست. اگر /set_upstream را با /sub/ بدهید، خودکار به قالب {{TOKEN}} تبدیل می‌شود.
+<b>دستورات + مثال فارسی</b>
+• <code>/panel</code> — نمایش پنل
+  مثال: <code>/panel</code>
+• <code>/help</code> — نمایش همین راهنما
+  مثال: <code>/help</code>
+• <code>/set_upstream</code> — تنظیم لینک پنل/آپ‌استریم
+  مثال: <code>/set_upstream https://panel.example/sub/{{TOKEN}}</code>
+• <code>/set_domain</code> — تنظیم دامنه اختصاصی
+  مثال: <code>/set_domain sub.goldmarket.ir</code>
+• <code>/verify_domain</code> — بررسی تایید دامنه
+  مثال: <code>/verify_domain</code>
+• <code>/set_channel</code> — تنظیم کانال اعلان
+  مثال: <code>/set_channel @goldmarket_logs</code>
+• <code>/link</code> — نمایش پیشوند لینک اشتراک
+  مثال: <code>/link</code>
+• <code>/customers</code> — لیست مشتری‌ها
+  مثال: <code>/customers</code>
+• <code>/add_customer</code> — ساخت مشتری جدید
+  مثال: <code>/add_customer Ali-Tehran</code>
+• <code>/customer</code> — نمایش جزئیات یک مشتری
+  مثال: <code>/customer CUSTOMER_ID</code>
+• <code>/del_customer</code> — حذف نرم مشتری
+  مثال: <code>/del_customer CUSTOMER_ID</code>
+• <code>/toggle_customer</code> — فعال/غیرفعال مشتری
+  مثال: <code>/toggle_customer CUSTOMER_ID</code>
+• <code>/add_sub_link</code> — افزودن لینک اشتراک جدید
+  مثال: <code>/add_sub_link https://source.example/sub/xyz</code>
+• <code>/subs</code> — لیست لینک‌های اشتراک + شناسه
+  مثال: <code>/subs</code>
+• <code>/toggle_sub_link</code> — فعال/غیرفعال لینک اشتراک
+  مثال: <code>/toggle_sub_link SUB_LINK_ID</code>
+• <code>/del_sub_link</code> — حذف لینک اشتراک
+  مثال: <code>/del_sub_link SUB_LINK_ID</code>
+• <code>/extras</code> — نمایش افزودنی‌ها
+  مثال: <code>/extras</code>
+• <code>/add_extra</code> — افزودنی جدید با متن طولانی
+  مثال: <code>/add_extra Iran-Mix | vmess://...
+vless://...
+ss://...</code>
+• <code>/rules</code> — نمایش قوانین فعلی
+  مثال: <code>/rules</code>
+• <code>/set_rules</code> — تغییر قوانین خروجی
+  مثال: <code>/set_rules merge=append dedupe=1 sanitize=1 prefix=VIP_ keywords=ads,spam format=base64</code>
+• <code>/rotate</code> — چرخش لینک اصلی
+  مثال: <code>/rotate</code>
+• <code>/logs</code> — لاگ‌های اخیر
+  مثال: <code>/logs</code>
+• <code>/cancel</code> — لغو عملیات مرحله‌ای
+  مثال: <code>/cancel</code>
+
+<b>نکته Smart Paste</b>
+اگر فقط لینک پنل مشتری را بفرستید، ربات آن را تشخیص می‌دهد.
+اگر <code>/set_upstream</code> شامل <code>/sub/</code> باشد، توکن به‌صورت خودکار به <code>{{TOKEN}}</code> نرمال می‌شود.
     `.trim();
     return {
       text,
